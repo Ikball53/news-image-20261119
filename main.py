@@ -1,876 +1,361 @@
 #!/usr/bin/env python3
-"""The World in One Picture - Thursday 19 November 2026.
+"""One-picture front page for Thursday 19 November 2026.
 
-A pure-stdlib newspaper front page generator for make.fun's
-"Sum up 19 November's world news in one image" bounty.
-
-- 40 stories genuinely reported on 19 November 2026.
-- Type is set in real fonts (Archivo Black + Liberation Sans, OFL),
-  pre-rendered to grayscale glyph bitmaps in glyphs.py and stamped
-  here with area-averaged downscaling. No Pillow at run time.
-- Illustrations are drawn with vector primitives (gradients with
-  ordered dithering, polygons, circles) - no image assets.
-- Output: a 1024x1024 PNG written to $MAKEFUN_OUTPUT_DIR/entry.png
-  (or /output/entry.png on the grader, or next to this script).
-- Deterministic: same bytes on every run.
+Draws a 1024x1024 newspaper page carrying forty stories: a lead summit
+story with a dotted world map beside it, three featured cards, a nine-card
+grid, and twenty-seven one-line briefs.  Lettering comes from real typefaces
+that were rendered ahead of time into grayscale glyph bitmaps (see
+tools/build_glyphs.py); this program only stamps scaled copies of those
+bitmaps, paints flat editorial illustrations with simple shapes, and writes
+a PNG using nothing beyond the standard library.  Every run produces the
+exact same bytes.
 """
 
 import base64
+import json
+import math
 import os
-import pickle
 import struct
+import sys
 import zlib
 from pathlib import Path
 
-from glyphs import BLOB
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from glyphs import FACES, RENDER_PX  # noqa: E402
 
 PAGE_W = 1024
 PAGE_H = 1024
-MARGIN = 24
+MARGIN = 30
 CONTENT_W = PAGE_W - 2 * MARGIN
 
-# ---------------------------------------------------------------- palette
-PAPER = (250, 246, 235)
-NAVY = (15, 41, 83)
-NAVY_DARK = (10, 28, 58)
-RED = (196, 30, 42)
-RED_DARK = (172, 22, 34)
-GREY = (96, 92, 84)
-HAIRLINE = (205, 194, 170)
-CARD_BG = (253, 250, 243)
-GOLD = (212, 160, 32)
-SKY_TOP = (120, 178, 224)
-SKY_BOT = (214, 236, 248)
-SEA = (38, 102, 156)
-SEA_DARK = (24, 74, 120)
-
-BAYER4 = (
-    (0, 8, 2, 10),
-    (12, 4, 14, 6),
-    (3, 11, 1, 9),
-    (15, 7, 13, 5),
-)
+PAPER = (248, 244, 233)
+NAVY = (17, 43, 88)
+NAVY_SOFT = (38, 68, 120)
+RED = (198, 28, 38)
+GREY = (104, 104, 104)
+HAIR = (198, 192, 176)
+GOLD = (214, 162, 34)
+WHITE = (255, 255, 255)
+INK = (30, 30, 30)
 
 
-def mix(c1, c2, t):
-    return tuple(int(round(a + (b - a) * t)) for a, b in zip(c1, c2))
+# --------------------------------------------------------------------------
+# Raster sheet: a plain RGB byte buffer with a small set of paint tools.
+# --------------------------------------------------------------------------
 
+class Sheet:
+    def __init__(self, width, height, colour):
+        self.w = width
+        self.h = height
+        self.px = bytearray(bytes(colour) * (width * height))
+        self.clip = (0, 0, width, height)
 
-# ---------------------------------------------------------------- canvas
-class Canvas:
-    def __init__(self, w, h, bg):
-        self.w = w
-        self.h = h
-        self.px = bytearray(bytes(bg) * (w * h))
-        self.clip = (0, 0, w, h)
-
-    def set_clip(self, x, y, w, h):
-        self.clip = (max(0, x), max(0, y), min(self.w, x + w), min(self.h, y + h))
+    def set_clip(self, x0, y0, x1, y1):
+        self.clip = (max(0, int(x0)), max(0, int(y0)),
+                     min(self.w, int(x1)), min(self.h, int(y1)))
 
     def clear_clip(self):
         self.clip = (0, 0, self.w, self.h)
 
-    def set_px(self, x, y, color, alpha=255):
+    def put(self, x, y, colour):
+        cx0, cy0, cx1, cy1 = self.clip
+        if cx0 <= x < cx1 and cy0 <= y < cy1:
+            i = (y * self.w + x) * 3
+            self.px[i], self.px[i + 1], self.px[i + 2] = colour
+
+    def blend(self, x, y, colour, alpha):
+        """Alpha 0..255; used when stamping glyph ink."""
+        if alpha <= 0:
+            return
         cx0, cy0, cx1, cy1 = self.clip
         if cx0 <= x < cx1 and cy0 <= y < cy1:
             i = (y * self.w + x) * 3
             if alpha >= 255:
-                self.px[i:i + 3] = bytes(color)
-            elif alpha > 0:
-                a = alpha / 255.0
-                self.px[i] = int(self.px[i] * (1 - a) + color[0] * a)
-                self.px[i + 1] = int(self.px[i + 1] * (1 - a) + color[1] * a)
-                self.px[i + 2] = int(self.px[i + 2] * (1 - a) + color[2] * a)
+                self.px[i], self.px[i + 1], self.px[i + 2] = colour
+            else:
+                keep = 255 - alpha
+                self.px[i] = (colour[0] * alpha + self.px[i] * keep) // 255
+                self.px[i + 1] = (colour[1] * alpha + self.px[i + 1] * keep) // 255
+                self.px[i + 2] = (colour[2] * alpha + self.px[i + 2] * keep) // 255
 
-    def fill_rect(self, x, y, w, h, color):
+    def rect(self, x, y, w, h, colour):
+        x, y, w, h = int(x), int(y), int(w), int(h)
         cx0, cy0, cx1, cy1 = self.clip
-        x0, y0 = max(cx0, x), max(cy0, y)
-        x1, y1 = min(cx1, x + w), min(cy1, y + h)
+        x0, y0 = max(x, cx0), max(y, cy0)
+        x1, y1 = min(x + w, cx1), min(y + h, cy1)
         if x1 <= x0 or y1 <= y0:
             return
-        row = bytes(color) * (x1 - x0)
+        row = bytes(colour) * (x1 - x0)
         for yy in range(y0, y1):
             i = (yy * self.w + x0) * 3
             self.px[i:i + len(row)] = row
 
-    def gradient_rect(self, x, y, w, h, top, bottom, dither=True):
-        for yy in range(h):
-            t = yy / max(1, h - 1)
-            base = mix(top, bottom, t)
-            for xx in range(w):
-                if dither:
-                    d = (BAYER4[yy % 4][xx % 4] - 7.5) / 255.0 * 18
-                    col = tuple(max(0, min(255, int(round(c + d)))) for c in base)
-                else:
-                    col = base
-                self.set_px(x + xx, y + yy, col)
+    def vgrad(self, x, y, w, h, top, bottom):
+        for row in range(int(h)):
+            t = row / max(1, int(h) - 1)
+            c = tuple(int(top[k] + (bottom[k] - top[k]) * t) for k in range(3))
+            self.rect(x, int(y) + row, w, 1, c)
 
-    def hline(self, x, y, w, color, thick=1):
-        self.fill_rect(x, y, w, thick, color)
+    def hgrad(self, x, y, w, h, left, right):
+        for col in range(int(w)):
+            t = col / max(1, int(w) - 1)
+            c = tuple(int(left[k] + (right[k] - left[k]) * t) for k in range(3))
+            self.rect(int(x) + col, y, 1, h, c)
 
-    def vline(self, x, y, h, color, thick=1):
-        self.fill_rect(x, y, thick, h, color)
-
-    def line(self, x0, y0, x1, y1, color, width=1):
-        dx, dy = x1 - x0, y1 - y0
-        steps = max(abs(dx), abs(dy), 1)
-        r = width // 2
+    def line(self, x0, y0, x1, y1, colour, thick=1):
+        steps = max(abs(int(x1) - int(x0)), abs(int(y1) - int(y0)), 1)
+        r = thick // 2
         for s in range(steps + 1):
-            cx = x0 + dx * s // steps
-            cy = y0 + dy * s // steps
-            for oy in range(-r, width - r):
-                for ox in range(-r, width - r):
-                    self.set_px(cx + ox, cy + oy, color)
+            t = s / steps
+            cx = int(round(x0 + (x1 - x0) * t))
+            cy = int(round(y0 + (y1 - y0) * t))
+            if thick <= 1:
+                self.put(cx, cy, colour)
+            else:
+                self.rect(cx - r, cy - r, thick, thick, colour)
 
-    def circle(self, cx, cy, r, color, alpha=255):
+    def disc(self, cx, cy, r, colour):
+        cx, cy, r = int(cx), int(cy), int(r)
         for yy in range(cy - r, cy + r + 1):
-            for xx in range(cx - r, cx + r + 1):
-                if (xx - cx) ** 2 + (yy - cy) ** 2 <= r * r:
-                    self.set_px(xx, yy, color, alpha)
+            dy = yy - cy
+            span = int(math.sqrt(max(0, r * r - dy * dy)))
+            self.rect(cx - span, yy, 2 * span + 1, 1, colour)
 
-    def ellipse(self, cx, cy, rx, ry, color, alpha=255):
-        if rx <= 0 or ry <= 0:
-            return
-        for yy in range(cy - ry, cy + ry + 1):
-            for xx in range(cx - rx, cx + rx + 1):
-                if ((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2 <= 1.0:
-                    self.set_px(xx, yy, color, alpha)
+    def ring(self, cx, cy, r, colour, thick=1):
+        steps = max(24, int(r * 6))
+        for s in range(steps + 1):
+            a = 2 * math.pi * s / steps
+            for t in range(thick):
+                rr = r - t
+                self.put(int(round(cx + rr * math.cos(a))),
+                         int(round(cy + rr * math.sin(a))), colour)
 
-    def ring(self, cx, cy, r, color, width=2):
-        for yy in range(cy - r - width, cy + r + width + 1):
-            for xx in range(cx - r - width, cx + r + width + 1):
-                d = ((xx - cx) ** 2 + (yy - cy) ** 2) ** 0.5
-                if r - width / 2 <= d <= r + width / 2:
-                    self.set_px(xx, yy, color)
+    def arc(self, cx, cy, r, a0, a1, colour, thick=1):
+        steps = max(12, int(abs(a1 - a0) * max(1, int(r))))
+        for s in range(steps + 1):
+            a = a0 + (a1 - a0) * s / steps
+            for t in range(thick):
+                rr = r - t
+                self.put(int(round(cx + rr * math.cos(a))),
+                         int(round(cy + rr * math.sin(a))), colour)
 
-    def polygon(self, pts, color):
+    def poly(self, points, colour):
+        pts = [(float(px), float(py)) for px, py in points]
         ys = [p[1] for p in pts]
-        y0, y1 = max(0, min(ys)), min(self.h - 1, max(ys))
+        y_lo, y_hi = int(math.floor(min(ys))), int(math.ceil(max(ys)))
         n = len(pts)
-        for yy in range(y0, y1 + 1):
-            nodes = []
+        for yy in range(y_lo, y_hi + 1):
+            hits = []
             for i in range(n):
-                x_a, y_a = pts[i]
-                x_b, y_b = pts[(i + 1) % n]
-                if y_a == y_b:
+                x0, y0 = pts[i]
+                x1, y1 = pts[(i + 1) % n]
+                if y0 == y1:
                     continue
-                if (y_a <= yy < y_b) or (y_b <= yy < y_a):
-                    nodes.append(x_a + (yy - y_a) * (x_b - x_a) / (y_b - y_a))
-            nodes.sort()
-            for i in range(0, len(nodes) - 1, 2):
-                xa, xb = int(round(nodes[i])), int(round(nodes[i + 1]))
-                for xx in range(max(0, xa), min(self.w - 1, xb) + 1):
-                    self.set_px(xx, yy, color)
+                if (y0 <= yy < y1) or (y1 <= yy < y0):
+                    hits.append(x0 + (yy - y0) * (x1 - x0) / (y1 - y0))
+            hits.sort()
+            for k in range(0, len(hits) - 1, 2):
+                self.rect(int(round(hits[k])), yy,
+                          int(round(hits[k + 1])) - int(round(hits[k])) + 1, 1, colour)
 
-    def star(self, cx, cy, r_out, r_in, color, points=5):
-        import math
+    def star(self, cx, cy, r, colour, points=5):
         pts = []
         for i in range(points * 2):
-            r = r_out if i % 2 == 0 else r_in
-            ang = -math.pi / 2 + i * math.pi / points
-            pts.append((int(round(cx + r * math.cos(ang))),
-                        int(round(cy + r * math.sin(ang)))))
-        self.polygon(pts, color)
-
-    def burst(self, cx, cy, r, color, spikes=12):
-        import math
-        pts = []
-        for i in range(spikes * 2):
-            rr = r if i % 2 == 0 else int(r * 0.45)
-            ang = i * math.pi / spikes
-            pts.append((int(round(cx + rr * math.cos(ang))),
-                        int(round(cy + rr * math.sin(ang)))))
-        self.polygon(pts, color)
-
-    def frame(self, x, y, w, h, color, thick=1):
-        self.hline(x, y, w, color, thick)
-        self.hline(x, y + h - thick, w, color, thick)
-        self.vline(x, y, h, color, thick)
-        self.vline(x + w - thick, y, h, color, thick)
+            rr = r if i % 2 == 0 else r * 0.45
+            a = -math.pi / 2 + i * math.pi / points
+            pts.append((cx + rr * math.cos(a), cy + rr * math.sin(a)))
+        self.poly(pts, colour)
 
 
-# ---------------------------------------------------------------- text
-FONTS = pickle.loads(zlib.decompress(base64.b64decode(BLOB)))
-_GLYPH_CACHE = {}
+# --------------------------------------------------------------------------
+# Typefaces: decode the baked glyph tables and stamp scaled ink.
+# --------------------------------------------------------------------------
 
+class Typeface:
+    def __init__(self, blob):
+        data = json.loads(zlib.decompress(base64.b64decode(blob)).decode("utf-8"))
+        self.ascent = data["ascent"]
+        self.glyphs = {}
+        for ch, rec in data["glyphs"].items():
+            adv64, w, h, xo, yo, b64 = rec
+            self.glyphs[ch] = (adv64, w, h, xo, yo,
+                               base64.b64decode(b64) if b64 else b"")
+        self.cache = {}
 
-def _resample(bitmap, w, h, scale):
-    """Area-average downscale of a grayscale bitmap by `scale` (<1)."""
-    nw = max(1, int(round(w * scale)))
-    nh = max(1, int(round(h * scale)))
-    out = bytearray(nw * nh)
-    inv = 1.0 / scale
-    for oy in range(nh):
-        sy0 = oy * inv
-        sy1 = min(h, (oy + 1) * inv)
-        iy0, iy1 = int(sy0), max(int(sy0) + 1, int(sy1 + 0.999))
-        for ox in range(nw):
-            sx0 = ox * inv
-            sx1 = min(w, (ox + 1) * inv)
-            ix0, ix1 = int(sx0), max(int(sx0) + 1, int(sx1 + 0.999))
-            total = 0.0
-            area = 0.0
-            for sy in range(iy0, min(iy1, h)):
-                wy = min(sy + 1, sy1) - max(sy, sy0)
-                if wy <= 0:
-                    continue
-                row = sy * w
-                for sx in range(ix0, min(ix1, w)):
-                    wx = min(sx + 1, sx1) - max(sx, sx0)
-                    if wx <= 0:
+    def advance(self, ch, size):
+        rec = self.glyphs.get(ch) or self.glyphs["?"]
+        return rec[0] / 64.0 * size / RENDER_PX
+
+    def text_width(self, text, size):
+        return sum(self.advance(ch, size) for ch in text)
+
+    def scaled(self, ch, size):
+        """Area-averaged copy of one glyph bitmap at the wanted size."""
+        key = (ch, round(size, 2))
+        if key in self.cache:
+            return self.cache[key]
+        adv64, w, h, xo, yo, raw = self.glyphs.get(ch) or self.glyphs["?"]
+        scale = size / RENDER_PX
+        adv = adv64 / 64.0 * scale
+        if w == 0 or h == 0:
+            out = (0, 0, b"", adv, 0.0, 0.0)
+            self.cache[key] = out
+            return out
+        dw = max(1, int(round(w * scale)))
+        dh = max(1, int(round(h * scale)))
+        buf = bytearray(dw * dh)
+        for dy in range(dh):
+            sy0 = dy / scale
+            sy1 = (dy + 1) / scale
+            iy0, iy1 = int(math.floor(sy0)), min(h, int(math.ceil(sy1)))
+            for dx in range(dw):
+                sx0 = dx / scale
+                sx1 = (dx + 1) / scale
+                ix0, ix1 = int(math.floor(sx0)), min(w, int(math.ceil(sx1)))
+                total = 0.0
+                weight = 0.0
+                for iy in range(iy0, iy1):
+                    wy = min(sy1, iy + 1) - max(sy0, iy)
+                    if wy <= 0:
                         continue
-                    total += bitmap[row + sx] * wx * wy
-                    area += wx * wy
-            out[oy * nw + ox] = int(total / area) if area > 0 else 0
-    return bytes(out), nw, nh
+                    base = iy * w
+                    for ix in range(ix0, ix1):
+                        wx = min(sx1, ix + 1) - max(sx0, ix)
+                        if wx <= 0:
+                            continue
+                        total += raw[base + ix] * wx * wy
+                        weight += wx * wy
+                buf[dy * dw + dx] = int(total / weight) if weight else 0
+        out = (dw, dh, bytes(buf), adv, xo * scale, yo * scale)
+        self.cache[key] = out
+        return out
 
+    def stamp(self, sheet, text, x, baseline, size, colour):
+        scale = size / RENDER_PX
+        top = baseline - self.ascent * scale
+        pen = float(x)
+        for ch in text:
+            dw, dh, buf, adv, xo, yo = self.scaled(ch, size)
+            if dw and dh:
+                gx = int(round(pen + xo))
+                gy = int(round(top + yo))
+                for yy in range(dh):
+                    base = yy * dw
+                    for xx in range(dw):
+                        v = buf[base + xx]
+                        if v:
+                            sheet.blend(gx + xx, gy + yy, colour, v)
+            pen += adv
+        return pen
 
-def glyph(fontname, ch, cap_target):
-    key = (fontname, ch, round(cap_target, 1))
-    if key in _GLYPH_CACHE:
-        return _GLYPH_CACHE[key]
-    font = FONTS[fontname]
-    scale = cap_target / font["cap"]
-    g = font["glyphs"].get(ch) or font["glyphs"]["?"]
-    advance, w, h, xoff, yoff, bitmap = g
-    if w == 0 or h == 0:
-        result = (b"", 0, 0, advance * scale, 0.0, 0.0)
-    else:
-        small, nw, nh = _resample(bitmap, w, h, scale)
-        result = (small, nw, nh, advance * scale, xoff * scale, yoff * scale)
-    _GLYPH_CACHE[key] = result
-    return result
-
-
-def text_width(fontname, s, cap):
-    return sum(glyph(fontname, ch, cap)[3] for ch in s)
-
-
-def draw_text(cv, fontname, s, x, baseline, cap, color):
-    cx = float(x)
-    for ch in s:
-        bitmap, w, h, advance, xoff, yoff = glyph(fontname, ch, cap)
-        if w and h:
-            gx = int(round(cx + xoff))
-            gy = int(round(baseline - yoff))
-            for yy in range(h):
-                row = yy * w
-                for xx in range(w):
-                    v = bitmap[row + xx]
-                    if v:
-                        cv.set_px(gx + xx, gy + yy, color, v)
-        cx += advance
-    return cx
-
-
-def wrap(fontname, s, cap, max_w):
-    lines = []
-    current = ""
-    for word in s.split(" "):
-        trial = word if not current else current + " " + word
-        if text_width(fontname, trial, cap) <= max_w or not current:
-            current = trial
-        else:
+    def wrap(self, text, size, max_width, max_lines):
+        words = text.split()
+        lines = []
+        current = ""
+        for word in words:
+            trial = (current + " " + word).strip()
+            if self.text_width(trial, size) <= max_width or not current:
+                current = trial
+            else:
+                lines.append(current)
+                current = word
+                if len(lines) == max_lines:
+                    break
+        if current and len(lines) < max_lines:
             lines.append(current)
-            current = word
-    if current:
-        lines.append(current)
-    return lines
+        return lines
 
 
-def draw_block(cv, fontname, s, x, y_top, cap, color, max_w, line_gap=1.22,
-               max_lines=99):
-    lines = wrap(fontname, s, cap, max_w)[:max_lines]
-    baseline = y_top + cap
-    for line_text in lines:
-        draw_text(cv, fontname, line_text, x, baseline, cap, color)
-        baseline += cap * line_gap
-    return int(round(baseline - cap * line_gap))  # bottom of last cap box
+BLACK = Typeface(FACES["black"])
+BOLD = Typeface(FACES["bold"])
+REGULAR = Typeface(FACES["regular"])
 
 
-def fit_cap(fontname, s, max_w, cap_hi=140.0):
-    lo, hi = 4.0, cap_hi
-    for _ in range(24):
-        mid = (lo + hi) / 2
-        if text_width(fontname, s, mid) <= max_w:
-            lo = mid
-        else:
-            hi = mid
-    return lo
+def fit_size(face, text, start, max_width, floor=8.0):
+    size = float(start)
+    while size > floor and face.text_width(text, size) > max_width:
+        size -= 0.5
+    return size
 
 
-def badge(cv, x, y, number, region):
-    """Red number disc + region label; returns x after the label."""
-    cv.circle(x + 8, y + 8, 8, RED)
-    num = str(number)
-    cap = 9.5
-    w = text_width("bold", num, cap)
-    draw_text(cv, "bold", num, x + 8 - w / 2, y + 8 + cap * 0.36, cap, (255, 255, 255))
-    draw_text(cv, "bold", region, x + 21, y + 8 + 11 * 0.36, 11, RED_DARK)
-    return x + 21 + text_width("bold", region, 11)
+def stamp_lines(sheet, face, lines, x, baseline, size, colour, leading):
+    y = baseline
+    for line in lines:
+        face.stamp(sheet, line, x, y, size, colour)
+        y += leading
+    return y
 
 
-# ---------------------------------------------------------------- scenes
-def sky(cv, x, y, w, h, top=SKY_TOP, bottom=SKY_BOT):
-    cv.gradient_rect(x, y, w, h, top, bottom)
+# --------------------------------------------------------------------------
+# PNG output (filter 0 rows, fixed compression level: byte-identical runs).
+# --------------------------------------------------------------------------
+
+def png_bytes(sheet):
+    raw = bytearray()
+    stride = sheet.w * 3
+    for y in range(sheet.h):
+        raw.append(0)
+        raw += sheet.px[y * stride:(y + 1) * stride]
+
+    def chunk(kind, payload):
+        body = kind + payload
+        return (struct.pack(">I", len(payload)) + body
+                + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
+
+    ihdr = struct.pack(">IIBBBBB", sheet.w, sheet.h, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+            + chunk(b"IEND", b""))
 
 
-def cloud(cv, cx, cy, r, color=(255, 255, 255)):
-    cv.ellipse(cx, cy, r, max(2, r // 3), color)
-    cv.ellipse(cx - r // 2, cy + 1, r // 2, max(2, r // 4), color)
-    cv.ellipse(cx + r // 2, cy + 1, r // 2, max(2, r // 4), color)
+def output_path():
+    env_dir = os.environ.get("MAKEFUN_OUTPUT_DIR")
+    if env_dir:
+        return Path(env_dir) / "entry.png"
+    if Path("/output").is_dir():
+        return Path("/output/entry.png")
+    return Path(__file__).resolve().parent / "entry.png"
 
 
-def flag_china(cv, x, y, w, h):
-    cv.fill_rect(x, y, w, h, (222, 41, 16))
-    cv.star(x + w // 5, y + h // 3, max(3, h // 4), max(2, h // 7), (255, 222, 0))
-    for dx, dy in ((0.42, 0.14), (0.47, 0.32), (0.47, 0.52), (0.42, 0.7)):
-        cv.star(x + int(w * dx), y + int(h * dy), max(2, h // 8), max(1, h // 14),
-                (255, 222, 0))
+# --------------------------------------------------------------------------
+# Story content.
+# --------------------------------------------------------------------------
 
-
-def flag_usa(cv, x, y, w, h):
-    stripe_h = max(1, h // 7)
-    for i in range(7):
-        col = (179, 34, 52) if i % 2 == 0 else (255, 255, 255)
-        cv.fill_rect(x, y + i * stripe_h, w, stripe_h if i < 6 else h - 6 * stripe_h, col)
-    cw, ch = int(w * 0.42), stripe_h * 4
-    cv.fill_rect(x, y, cw, ch, (60, 59, 110))
-    for r in range(4):
-        for c in range(5):
-            cv.circle(x + 3 + c * max(3, cw // 5), y + 3 + r * max(3, ch // 4), 1,
-                      (255, 255, 255))
-
-
-def flag_russia(cv, x, y, w, h):
-    third = h // 3
-    cv.fill_rect(x, y, w, third, (255, 255, 255))
-    cv.fill_rect(x, y + third, w, third, (0, 57, 166))
-    cv.fill_rect(x, y + 2 * third, w, h - 2 * third, (213, 43, 30))
-
-
-def suited_figure(cv, cx, base_y, height, suit=(38, 44, 66), skin=(232, 190, 150),
-                  hair=(70, 60, 50)):
-    head_r = max(3, height // 7)
-    cv.circle(cx, base_y - height + head_r, head_r, skin)
-    cv.ellipse(cx, base_y - height + head_r - head_r // 2, head_r, head_r // 2, hair)
-    shoulder = base_y - height + head_r * 2
-    cv.polygon([(cx - height // 4, base_y), (cx - height // 5, shoulder),
-                (cx + height // 5, shoulder), (cx + height // 4, base_y)], suit)
-    cv.polygon([(cx - 3, shoulder), (cx + 3, shoulder), (cx, shoulder + height // 4)],
-               (245, 245, 245))
-    cv.polygon([(cx - 1, shoulder + 2), (cx + 1, shoulder + 2),
-                (cx, shoulder + height // 5)], RED)
-
-
-def scene_summit(cv, x, y, w, h):
-    sky(cv, x, y, w, h, (250, 214, 160), (252, 240, 214))
-    # Shenzhen skyline
-    base = y + h - 34
-    towers = [(0.02, 0.42), (0.10, 0.62), (0.18, 0.5), (0.30, 0.72), (0.42, 0.55),
-              (0.55, 0.8), (0.66, 0.6), (0.76, 0.7), (0.86, 0.52), (0.94, 0.64)]
-    for fx, fh in towers:
-        tw = max(8, w // 22)
-        tx = x + int(w * fx)
-        th = int((h - 40) * fh)
-        cv.fill_rect(tx, base - th, tw, th, (120, 140, 170))
-        for wy in range(base - th + 4, base - 4, 7):
-            for wx in range(tx + 2, tx + tw - 2, 5):
-                cv.set_px(wx, wy, (230, 240, 250))
-    cv.fill_rect(x, base, w, 4, (150, 130, 105))
-    # three leaders first (the table will cover their lower bodies)
-    table_y = y + h - 24
-    spots = [(0.24, flag_china), (0.50, flag_usa), (0.76, flag_russia)]
-    for fx, _flag_fn in spots:
-        cx = x + int(w * fx)
-        suited_figure(cv, cx, y + h - 6, 84)
-    # long table over the figures' laps
-    cv.fill_rect(x + 30, table_y, w - 60, 10, (96, 64, 40))
-    cv.fill_rect(x + 30, table_y, w - 60, 3, (140, 100, 62))
-    cv.fill_rect(x + 44, table_y + 10, 8, h - (table_y - y) - 10, (80, 54, 34))
-    cv.fill_rect(x + w - 52, table_y + 10, 8, h - (table_y - y) - 10, (80, 54, 34))
-    # flags above each leader, plus microphone and name plate
-    for fx, flag_fn in spots:
-        cx = x + int(w * fx)
-        pole_top = y + 5
-        cv.vline(cx - 26, pole_top, table_y - pole_top - 36, (90, 90, 90), 2)
-        flag_fn(cv, cx - 24, pole_top, 46, 30)
-        cv.line(cx + 12, table_y, cx + 6, table_y - 12, (40, 40, 40), 2)
-        cv.circle(cx + 6, table_y - 13, 3, (40, 40, 40))
-        cv.fill_rect(cx - 16, table_y - 7, 32, 7, (255, 252, 240))
-
-
-def scene_bridge(cv, x, y, w, h):
-    sky(cv, x, y, w, h, (96, 150, 205), (196, 226, 244))
-    sea_y = y + h - 22
-    cv.gradient_rect(x, sea_y, w, h - (sea_y - y), SEA, SEA_DARK)
-    for i in range(6):
-        wy = sea_y + 4 + i * 3
-        for wx in range(x + (i * 13) % 30, x + w - 12, 34):
-            cv.hline(wx, wy, 10, (150, 200, 235), 1)
-    deck_y = y + 26
-    cv.fill_rect(x + 6, deck_y, w - 12, 5, (90, 96, 104))
-    cv.fill_rect(x + 6, deck_y, w - 12, 2, (150, 156, 164))
-    for fx in (0.12, 0.38, 0.64, 0.88):
-        px = x + int(w * fx)
-        cv.fill_rect(px, deck_y + 5, 7, sea_y - deck_y - 5, (110, 116, 124))
-    # broken span
-    cv.polygon([(x + int(w * 0.52), deck_y + 4), (x + int(w * 0.66), deck_y + 4),
-                (x + int(w * 0.60), deck_y + 20)], (70, 76, 84))
-    # explosion
-    ex, ey = x + int(w * 0.58), deck_y - 6
-    cv.burst(ex, ey, 26, (244, 120, 32), 12)
-    cv.burst(ex, ey, 17, (250, 178, 40), 10)
-    cv.burst(ex, ey, 9, (255, 230, 120), 8)
-    cloud(cv, ex - 22, ey - 18, 12, (120, 118, 116))
-    cloud(cv, ex + 18, ey - 24, 10, (140, 138, 136))
-    cloud(cv, ex + 2, ey - 32, 9, (160, 158, 156))
-
-
-def scene_ipo(cv, x, y, w, h):
-    sky(cv, x, y, w, h, (30, 58, 110), (70, 110, 170))
-    # exchange building
-    bx, bw = x + 18, int(w * 0.44)
-    by = y + h - 14
-    cv.polygon([(bx - 4, y + 26), (bx + bw // 2, y + 12), (bx + bw + 4, y + 26)],
-               (210, 216, 226))
-    cv.fill_rect(bx - 4, y + 26, bw + 8, 5, (190, 198, 210))
-    for i in range(5):
-        cx = bx + 8 + i * (bw - 12) // 4
-        cv.fill_rect(cx, y + 31, 7, by - y - 31, (225, 230, 238))
-    cv.fill_rect(bx - 6, by, bw + 12, 5, (170, 178, 192))
-    # rising chart
-    pts = [(x + int(w * 0.52), y + h - 18), (x + int(w * 0.64), y + h - 30),
-           (x + int(w * 0.74), y + h - 26), (x + int(w * 0.86), y + 22),
-           (x + int(w * 0.95), y + 14)]
-    for i in range(len(pts) - 1):
-        cv.line(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1], (46, 204, 113), 3)
-    cv.polygon([(pts[-1][0] + 2, pts[-1][1] - 7), (pts[-1][0] + 11, pts[-1][1] + 2),
-                (pts[-1][0] - 3, pts[-1][1] + 4)], (46, 204, 113))
-    for px, py in pts[:-1]:
-        cv.circle(px, py, 3, (255, 255, 255))
-    # coins
-    for fx, fy in ((0.58, 0.78), (0.66, 0.84), (0.74, 0.78)):
-        cx, cy = x + int(w * fx), y + int(h * fy)
-        cv.circle(cx, cy, 8, GOLD)
-        cv.circle(cx, cy, 6, (238, 192, 64))
-        draw_text(cv, "bold", "$", cx - 2, cy + 4, 9, (150, 105, 10))
-
-
-def scene_icj(cv, x, y, w, h):
-    sky(cv, x, y, w, h, (150, 190, 226), (226, 240, 248))
-    bx, bw = x + int(w * 0.14), int(w * 0.52)
-    by = y + h - 12
-    cv.polygon([(bx - 6, y + 22), (bx + bw // 2, y + 8), (bx + bw + 6, y + 22)],
-               (52, 66, 96))
-    cv.fill_rect(bx - 6, y + 22, bw + 12, 5, (70, 86, 118))
-    for i in range(6):
-        cx = bx + 6 + i * (bw - 10) // 5
-        cv.fill_rect(cx, y + 27, 6, by - y - 27, (238, 240, 244))
-    cv.fill_rect(bx - 8, by, bw + 16, 5, (90, 104, 130))
-    cv.fill_rect(bx - 12, by + 5, bw + 24, 4, (110, 122, 146))
-    # scales of justice
-    sx, sy = x + int(w * 0.84), y + 16
-    cv.vline(sx, sy, h - 34, GOLD, 3)
-    cv.hline(sx - 26, sy + 4, 52, GOLD, 3)
-    cv.circle(sx, sy + 2, 4, GOLD)
-    for side in (-1, 1):
-        pan_x = sx + side * 26
-        cv.line(pan_x, sy + 6, pan_x - 9, sy + 24, GOLD, 1)
-        cv.line(pan_x, sy + 6, pan_x + 9, sy + 24, GOLD, 1)
-        cv.ellipse(pan_x, sy + 26, 11, 4, GOLD)
-    cv.fill_rect(sx - 12, y + h - 16, 24, 4, GOLD)
-
-
-def scene_vangogh(cv, x, y, w, h):
-    cv.gradient_rect(x, y, w, h, (84, 62, 44), (120, 92, 64))
-    # framed painting with swirling sky
-    fx, fy, fw, fh = x + 22, y + 6, int(w * 0.52), h - 16
-    cv.fill_rect(fx - 4, fy - 4, fw + 8, fh + 8, (160, 118, 44))
-    cv.gradient_rect(fx, fy, fw, fh, (28, 52, 130), (70, 110, 190))
-    for cx, cy, r in ((0.25, 0.35, 9), (0.55, 0.25, 7), (0.78, 0.42, 8), (0.4, 0.6, 6)):
-        cv.ring(fx + int(fw * cx), fy + int(fh * cy), r, (250, 220, 110), 2)
-        cv.circle(fx + int(fw * cx), fy + int(fh * cy), 2, (255, 240, 170))
-    cv.ellipse(fx + fw // 2, fy + fh - 3, fw // 2, 5, (46, 92, 60))
-    # cypress silhouette in the painting
-    cv.polygon([(fx + fw - 14, fy + fh - 4), (fx + fw - 10, fy + 8),
-                (fx + fw - 6, fy + fh - 4)], (24, 60, 44))
-    # gavel + price tag
-    gx, gy = x + int(w * 0.72), y + h - 14
-    cv.line(gx, gy, gx + 24, gy - 20, (170, 120, 66), 5)
-    cv.fill_rect(gx + 16, gy - 29, 20, 9, (146, 98, 52))
-    cv.ellipse(gx + 8, gy + 3, 18, 3, (110, 76, 42))
-    tx, ty = x + int(w * 0.76), y + 5
-    cv.polygon([(tx, ty), (tx + 46, ty), (tx + 46, ty + 17), (tx + 8, ty + 17),
-                (tx, ty + 8)], (255, 250, 235))
-    draw_text(cv, "bold", "$190M", tx + 7, ty + 13, 9.5, RED_DARK)
-
-
-def scene_cyclone(cv, x, y, w, h):
-    sky(cv, x, y, w, h, (70, 96, 130), (150, 176, 200))
-    sea_y = y + h - 16
-    cv.gradient_rect(x, sea_y, w, h - (sea_y - y), (30, 84, 130), (18, 58, 96))
-    for i in range(5):
-        wy = sea_y + 3 + i * 3
-        for wx in range(x + (i * 17) % 26, x + w - 14, 30):
-            cv.hline(wx, wy, 12, (170, 210, 240), 1)
-    # spiral storm (offset rings read as a swirl, not a target)
-    cx, cy = x + int(w * 0.62), y + int(h * 0.42)
-    for r, col, ox, oy in ((26, (210, 218, 226), -5, 2), (20, (190, 200, 212), -3, 1),
-                           (14, (225, 232, 240), -1, 0), (8, (200, 212, 224), 0, 0)):
-        cv.ring(cx + ox, cy + oy, r, col, 4)
-    cv.circle(cx, cy, 4, (240, 246, 252))
-    cloud(cv, x + int(w * 0.2), y + 12, 16, (160, 172, 188))
-    cloud(cv, x + int(w * 0.88), y + 10, 13, (150, 164, 182))
-    # rain streaks
-    for i in range(16):
-        rx = x + 10 + (i * 37) % (w - 20)
-        ry = y + 8 + (i * 23) % (h - 34)
-        cv.line(rx, ry, rx - 5, ry + 10, (200, 222, 244), 1)
-    # bending palm
-    px = x + int(w * 0.14)
-    cv.line(px, sea_y + 2, px + 12, y + 18, (110, 80, 48), 4)
-    for ang in (-0.9, -0.4, 0.1, 0.6):
-        import math
-        ex = px + 12 + int(20 * math.cos(ang))
-        ey = y + 18 + int(10 * math.sin(ang)) + 6
-        cv.line(px + 12, y + 18, ex, ey, (52, 130, 66), 3)
-
-
-def scene_gta(cv, x, y, w, h):
-    cv.gradient_rect(x, y, w, h, (255, 138, 76), (255, 92, 168))
-    cv.circle(x + int(w * 0.72), y + int(h * 0.55), 16, (255, 226, 120))
-    # skyline silhouette
-    base = y + h - 12
-    for fx, fh in ((0.04, 0.4), (0.14, 0.62), (0.26, 0.48), (0.38, 0.7), (0.52, 0.55),
-                   (0.62, 0.42), (0.82, 0.6), (0.92, 0.45)):
-        tw = max(9, w // 18)
-        th = int((h - 14) * fh)
-        cv.fill_rect(x + int(w * fx), base - th, tw, th, (58, 32, 74))
-    cv.fill_rect(x, base, w, 12, (40, 24, 56))
-    # palm silhouettes
-    for fx in (0.10, 0.88):
-        px = x + int(w * fx)
-        cv.line(px, base + 8, px + 4, y + 14, (30, 18, 44), 4)
-        for dx, dy in ((-16, -2), (-8, -8), (2, -10), (12, -6), (18, 0)):
-            cv.line(px + 4, y + 14, px + 4 + dx, y + 14 + dy + 6, (30, 18, 44), 3)
-    # neon sign
-    draw_text(cv, "black", "VICE CITY", x + int(w * 0.30), y + 20, 13, (140, 240, 255))
-
-
-def scene_yacht(cv, x, y, w, h):
-    sky(cv, x, y, w, h, (74, 92, 118), (148, 168, 192))
-    cloud(cv, x + int(w * 0.22), y + 10, 18, (110, 122, 140))
-    cloud(cv, x + int(w * 0.72), y + 8, 15, (100, 114, 134))
-    sea_y = y + h - 14
-    cv.gradient_rect(x, sea_y, w, h - (sea_y - y), (26, 70, 116), (16, 48, 88))
-    for i in range(4):
-        wy = sea_y + 3 + i * 3
-        for wx in range(x + (i * 19) % 24, x + w - 16, 28):
-            cv.hline(wx, wy, 13, (160, 204, 238), 1)
-    # tilted superyacht
-    hx, hy = x + int(w * 0.30), sea_y - 8
-    cv.polygon([(hx, hy), (hx + 120, hy - 14), (hx + 104, hy + 6), (hx + 14, hy + 8)],
-               (240, 244, 248))
-    cv.polygon([(hx + 18, hy - 2), (hx + 40, hy - 16), (hx + 84, hy - 20),
-                (hx + 96, hy - 12)], (225, 232, 240))
-    for i in range(5):
-        cv.fill_rect(hx + 26 + i * 15, hy - 4 - i, 8, 4, (70, 110, 150))
-    cv.line(hx + 66, hy - 18, hx + 78, hy - 34, (200, 208, 218), 3)
-    # wind streaks
-    for i in range(5):
-        wy = y + 16 + i * 7
-        cv.line(x + int(w * 0.68), wy, x + int(w * 0.68) + 34, wy - 3,
-                (230, 240, 250), 2)
-
-
-def scene_tennis(cv, x, y, w, h):
-    cv.gradient_rect(x, y, w, h, (46, 110, 74), (34, 92, 60))
-    court_y = y + 8
-    cv.fill_rect(x + 14, court_y, w - 28, h - 16, (52, 126, 84))
-    cv.frame(x + 14, court_y, w - 28, h - 16, (245, 245, 245), 2)
-    cv.vline(x + w // 2, court_y, h - 16, (30, 30, 30), 3)
-    cv.hline(x + 14, court_y + (h - 16) // 2, w - 28, (245, 245, 245), 1)
-    # ball with trail
-    bx, by = x + int(w * 0.68), y + int(h * 0.34)
-    for i in range(4):
-        cv.circle(bx - 8 - i * 9, by + 3 + i * 3, 3 - i // 2, (200, 230, 90))
-    cv.circle(bx, by, 6, (214, 240, 96))
-    cv.ring(bx, by, 6, (150, 180, 60), 1)
-    # racket
-    rx, ry = x + int(w * 0.24), y + int(h * 0.52)
-    cv.ellipse(rx, ry, 13, 17, (250, 250, 250))
-    cv.ellipse(rx, ry, 10, 14, (52, 126, 84))
-    for i in range(-1, 2):
-        cv.vline(rx + i * 5, ry - 11, 22, (220, 220, 220), 1)
-        cv.hline(rx - 8, ry + i * 6, 16, (220, 220, 220), 1)
-    cv.line(rx + 3, ry + 15, rx + 12, ry + 28, (120, 80, 44), 4)
-
-
-def scene_datacentre(cv, x, y, w, h):
-    cv.gradient_rect(x, y, w, h, (24, 34, 58), (40, 58, 92))
-    # server racks
-    for r in range(4):
-        rx = x + 16 + r * ((w - 90) // 4)
-        rw = (w - 90) // 4 - 8
-        cv.fill_rect(rx, y + 10, rw, h - 22, (16, 24, 42))
-        cv.frame(rx, y + 10, rw, h - 22, (90, 120, 170), 1)
-        for row in range(5):
-            uy = y + 14 + row * ((h - 30) // 5)
-            cv.fill_rect(rx + 3, uy, rw - 6, 4, (52, 76, 118))
-            cv.circle(rx + rw - 7, uy + 2, 2,
-                      (80, 230, 120) if (row + r) % 3 else (255, 190, 70))
-    # cooling towers
-    tx = x + w - 52
-    cv.polygon([(tx, y + h - 12), (tx + 6, y + 22), (tx + 26, y + 22),
-                (tx + 32, y + h - 12)], (150, 166, 190))
-    cloud(cv, tx + 16, y + 14, 10, (220, 232, 244))
-    cv.fill_rect(x, y + h - 10, w, 10, (14, 22, 40))
-
-
-def scene_satellite(cv, x, y, w, h):
-    cv.gradient_rect(x, y, w, h, (8, 12, 34), (26, 40, 84))
-    for i in range(22):
-        sx = x + (i * 53) % w
-        sy = y + (i * 29) % (h - 20)
-        cv.set_px(sx, sy, (230, 238, 255))
-    # earth curve along the bottom edge
-    cv.ellipse(x + w // 2, y + h + 30, w // 2 + 10, 42, (52, 110, 190))
-    cv.ellipse(x + w // 2, y + h + 36, w // 2 + 10, 42, (74, 142, 212))
-    # falling satellite with flame trail
-    sx, sy = x + int(w * 0.60), y + int(h * 0.40)
-    for i in range(6):
-        cv.circle(sx - 10 - i * 8, sy - 6 - i * 5, 6 - i // 2,
-                  mix((255, 160, 60), (200, 60, 30), i / 6))
-    cv.fill_rect(sx - 8, sy - 6, 16, 12, (200, 208, 220))
-    cv.fill_rect(sx - 30, sy - 4, 20, 8, (70, 110, 190))
-    cv.fill_rect(sx + 10, sy - 4, 20, 8, (70, 110, 190))
-    cv.line(sx, sy + 6, sx - 6, sy + 16, (180, 190, 205), 2)
-    cv.circle(sx - 7, sy + 17, 3, (220, 228, 240))
-
-
-def scene_yellowline(cv, x, y, w, h):
-    cv.gradient_rect(x, y, w, h, (250, 214, 150), (240, 196, 120))
-    ground_y = y + h - 16
-    cv.fill_rect(x, ground_y, w, 16, (216, 178, 116))
-    # yellow painted line across the ground
-    cv.polygon([(x + 6, ground_y + 10), (x + w - 6, ground_y + 2),
-                (x + w - 6, ground_y + 8), (x + 6, ground_y + 16)], (250, 204, 40))
-    # border fence
-    fy = y + 16
-    for fx in range(x + 10, x + w - 8, 18):
-        cv.vline(fx, fy, ground_y - fy, (90, 84, 70), 2)
-    cv.hline(x + 8, fy + 2, w - 16, (110, 102, 86), 2)
-    cv.hline(x + 8, fy + 12, w - 16, (110, 102, 86), 2)
-    # watchtower
-    tx = x + int(w * 0.78)
-    cv.fill_rect(tx, y + 8, 22, 14, (120, 108, 88))
-    cv.polygon([(tx - 3, y + 8), (tx + 11, y + 1), (tx + 25, y + 8)], (96, 84, 66))
-    cv.line(tx + 3, y + 22, tx - 2, ground_y, (100, 90, 74), 3)
-    cv.line(tx + 19, y + 22, tx + 24, ground_y, (100, 90, 74), 3)
-    cv.fill_rect(tx + 4, y + 12, 14, 5, (60, 54, 44))
-
-
-def scene_dollar(cv, x, y, w, h):
-    cv.gradient_rect(x, y, w, h, (20, 70, 52), (34, 110, 78))
-    # big dollar coin rising
-    cx, cy = x + int(w * 0.34), y + int(h * 0.44)
-    cv.circle(cx, cy, 20, GOLD)
-    cv.circle(cx, cy, 16, (240, 198, 72))
-    draw_text(cv, "black", "$", cx - 6, cy + 9, 22, (150, 105, 10))
-    # up arrow
-    ax = x + int(w * 0.52)
-    cv.line(ax, y + h - 16, ax + 46, y + 16, (120, 240, 160), 4)
-    cv.polygon([(ax + 40, y + 10), (ax + 56, y + 18), (ax + 42, y + 26)],
-               (120, 240, 160))
-    # euro coin slipping down
-    ex, ey = x + int(w * 0.84), y + int(h * 0.62)
-    cv.circle(ex, ey, 13, (190, 198, 208))
-    cv.circle(ex, ey, 10, (214, 220, 228))
-    draw_text(cv, "bold", "€", ex - 5, ey + 6, 13, (90, 100, 115))
-    cv.line(ex + 16, ey - 12, ex + 24, ey + 6, (240, 120, 110), 3)
-    cv.polygon([(ex + 20, ey + 2), (ex + 28, ey + 12), (ex + 18, ey + 12)],
-               (240, 120, 110))
-
-
-PAINTERS = {
-    "summit": scene_summit,
-    "bridge": scene_bridge,
-    "ipo": scene_ipo,
-    "icj": scene_icj,
-    "vangogh": scene_vangogh,
-    "cyclone": scene_cyclone,
-    "gta": scene_gta,
-    "yacht": scene_yacht,
-    "tennis": scene_tennis,
-    "datacentre": scene_datacentre,
-    "satellite": scene_satellite,
-    "yellowline": scene_yellowline,
-    "dollar": scene_dollar,
-}
-
-
-# ---------------------------------------------------------------- map
-# Coarse dotted world map: land spans per row on a 64x30 grid.
-MAP_SPANS = {
-    2: [(3, 8), (30, 33), (38, 52)],
-    3: [(2, 14), (28, 35), (36, 56)],
-    4: [(2, 16), (28, 34), (35, 57)],
-    5: [(3, 16), (29, 33), (36, 56)],
-    6: [(4, 15), (29, 34), (38, 54)],
-    7: [(5, 14), (30, 36), (40, 52)],
-    8: [(6, 13), (30, 37), (42, 50)],
-    9: [(7, 12), (30, 37), (44, 49)],
-    10: [(8, 12), (30, 36), (45, 48)],
-    11: [(9, 13), (30, 36), (46, 48)],
-    12: [(10, 15), (31, 35), (47, 49)],
-    13: [(10, 16), (31, 35)],
-    14: [(11, 16), (32, 34)],
-    15: [(11, 16), (32, 34), (50, 56)],
-    16: [(12, 15), (33, 34), (50, 57)],
-    17: [(12, 15), (50, 57)],
-    18: [(12, 14), (51, 56)],
-    19: [(13, 14)],
-    20: [(13, 13), (58, 59)],
-}
-
-# Story locations as (col, row) on the map grid.
-MAP_DOTS = [
-    (50, 7),   # China (Shenzhen)
-    (37, 5),   # Ukraine
-    (8, 6),    # USA
-    (46, 9),   # Myanmar
-    (30, 4),   # Netherlands
-    (44, 9),   # India
-    (9, 4),    # Canada
-    (54, 6),   # Japan
-    (29, 4),   # UK
-    (28, 5),   # Ireland
-    (29, 6),   # Spain
-    (49, 12),  # Indonesia
-    (54, 17),  # Australia
-    (58, 20),  # New Zealand
-    (48, 11),  # Malaysia
-    (60, 14),  # Fiji
-    (38, 8),   # Gaza
-    (33, 12),  # Chad
-    (34, 5),   # Moldova
-    (42, 8),   # Pakistan
-    (44, 11),  # Sri Lanka
-]
-
-
-def draw_map(cv, x, y, w, h):
-    cols, rows = 64, 30
-    sx = w / cols
-    sy = h / rows
-    land = (178, 168, 146)
-    for row, spans in MAP_SPANS.items():
-        for c0, c1 in spans:
-            for col in range(c0, c1 + 1):
-                px = int(x + (col + 0.5) * sx)
-                py = int(y + (row + 0.5) * sy)
-                cv.circle(px, py, 2, land)
-    for col, row in MAP_DOTS:
-        px = int(x + (col + 0.5) * sx)
-        py = int(y + (row + 0.5) * sy)
-        cv.circle(px, py, 3, RED)
-        cv.circle(px, py, 1, (255, 255, 255))
-
-
-# ---------------------------------------------------------------- icons
-def mini_icon(cv, x, y, kind, color=NAVY):
-    if kind == "star":
-        cv.star(x + 5, y + 5, 5, 2, color)
-    elif kind == "drop":
-        cv.ellipse(x + 5, y + 6, 3, 4, color)
-        cv.polygon([(x + 5, y), (x + 2, y + 5), (x + 8, y + 5)], color)
-    elif kind == "ball":
-        cv.circle(x + 5, y + 5, 4, color)
-        cv.set_px(x + 4, y + 4, PAPER)
-    elif kind == "bolt":
-        cv.polygon([(x + 6, y), (x + 2, y + 6), (x + 5, y + 6), (x + 3, y + 10),
-                    (x + 8, y + 4), (x + 5, y + 4)], color)
-    elif kind == "check":
-        cv.line(x + 1, y + 6, x + 4, y + 9, color, 2)
-        cv.line(x + 4, y + 9, x + 9, y + 2, color, 2)
-    elif kind == "cross":
-        cv.line(x + 2, y + 2, x + 8, y + 8, color, 2)
-        cv.line(x + 8, y + 2, x + 2, y + 8, color, 2)
-    elif kind == "wave":
-        for i in range(3):
-            cv.hline(x + 1, y + 2 + i * 3, 8, color, 1)
-            cv.set_px(x + 1 + i * 3, y + 1 + i * 3, color)
-    elif kind == "coin":
-        cv.circle(x + 5, y + 5, 4, color)
-        cv.circle(x + 5, y + 5, 2, PAPER)
-    elif kind == "flag":
-        cv.vline(x + 2, y, 10, color, 1)
-        cv.polygon([(x + 3, y + 1), (x + 9, y + 3), (x + 3, y + 5)], color)
-    elif kind == "house":
-        cv.polygon([(x + 1, y + 5), (x + 5, y + 1), (x + 9, y + 5)], color)
-        cv.fill_rect(x + 3, y + 5, 4, 4, color)
-    elif kind == "plane":
-        cv.polygon([(x + 1, y + 8), (x + 9, y + 2), (x + 6, y + 9), (x + 4, y + 6)],
-                   color)
-    elif kind == "gear":
-        cv.ring(x + 5, y + 5, 4, color, 2)
-        cv.circle(x + 5, y + 5, 1, color)
-    else:  # diamond
-        cv.polygon([(x + 5, y), (x + 9, y + 5), (x + 5, y + 10), (x + 1, y + 5)], color)
-
-
-# ---------------------------------------------------------------- stories
-LEAD = {
-    "num": 1, "region": "CHINA", "art": "summit",
-    "headline": "Trump, Xi and Putin meet in Shenzhen",
-    "deck": "First three-way summit of the nuclear powers opens the APEC meeting, "
-            "with arms control and trade on the table",
-}
+LEAD = ("CHINA", "Trump, Xi and Putin meet in Shenzhen",
+        "First three-way summit of the nuclear powers opens the APEC "
+        "meeting, with arms control and trade on the table")
 
 FEATURED = [
-    {"num": 2, "region": "UKRAINE", "art": "bridge",
-     "headline": "Crimea bridge hit again as blasts rock span",
-     "deck": "New video shows explosions before part collapses"},
-    {"num": 3, "region": "UNITED STATES", "art": "ipo",
-     "headline": "Anthropic prices IPO at $83 a share",
-     "deck": "Claude maker's debut is the year's biggest listing"},
-    {"num": 4, "region": "MYANMAR", "art": "icj",
-     "headline": "ICJ rules on Rohingya genocide case",
-     "deck": "Court decides if 2017 army campaign was genocide"},
+    ("UKRAINE", "Crimea bridge hit again as blasts rock span",
+     "New video shows explosions before part collapses", "bridge"),
+    ("UNITED STATES", "Anthropic prices IPO at $83 a share",
+     "Claude maker's debut is the year's biggest listing", "ipo"),
+    ("MYANMAR", "ICJ rules on Rohingya genocide case",
+     "Court decides if 2017 army campaign was genocide", "icj"),
 ]
 
 GRID = [
-    {"num": 5, "region": "NETHERLANDS", "art": "vangogh",
-     "headline": "Van Gogh sells for record $190.4M",
-     "deck": "Top price after Nazi-row sale"},
-    {"num": 6, "region": "INDIA", "art": "cyclone",
-     "headline": "Cyclone Akvan bears down on India",
-     "deck": "Storm surge feared as coast braces"},
-    {"num": 7, "region": "WORLDWIDE", "art": "gta",
-     "headline": "GTA VI unlocks at midnight in NZ",
-     "deck": "Gamers enter Vice City as rollout begins"},
-    {"num": 8, "region": "UNITED KINGDOM", "art": "yacht",
-     "headline": "Bayesian report blames high winds",
-     "deck": "Superyacht had flaw no one spotted"},
-    {"num": 9, "region": "SPAIN", "art": "tennis",
-     "headline": "Italy face Ukraine in BJK Cup semis",
-     "deck": "Seville hosts the last-four showdown"},
-    {"num": 10, "region": "AUSTRALIA", "art": "datacentre",
-     "headline": "Nine new data centres planned",
-     "deck": "Power and water fears grow in regions"},
-    {"num": 11, "region": "SPACE", "art": "satellite",
-     "headline": "NASA: Swift fell over Indonesia",
-     "deck": "Burst telescope ends 21-year mission"},
-    {"num": 12, "region": "MIDDLE EAST", "art": "yellowline",
-     "headline": "Israel troops pass Gaza Yellow Line",
-     "deck": "Advance crosses ceasefire boundary"},
-    {"num": 13, "region": "MARKETS", "art": "dollar",
-     "headline": "Dollar hits 19-month high, euro slips",
-     "deck": "Greenback climbs as euro slides"},
+    ("NETHERLANDS", "Van Gogh sells for record $190.4M",
+     "Top price after Nazi-row sale", "vangogh"),
+    ("INDIA", "Cyclone Akvan bears down on India",
+     "Storm surge feared as coast braces", "cyclone"),
+    ("WORLDWIDE", "GTA VI unlocks at midnight in NZ",
+     "Gamers enter Vice City as rollout begins", "gta"),
+    ("UNITED KINGDOM", "Bayesian report blames high winds",
+     "Superyacht had flaw no one spotted", "yacht"),
+    ("SPAIN", "Italy face Ukraine in BJK Cup semis",
+     "Seville hosts the last-four showdown", "tennis"),
+    ("AUSTRALIA", "Nine new data centres planned",
+     "Power and water fears grow in regions", "datacentre"),
+    ("SPACE", "NASA: Swift fell over Indonesia",
+     "Burst telescope ends 21-year mission", "satellite"),
+    ("MIDDLE EAST", "Israel troops pass Gaza Yellow Line",
+     "Advance crosses ceasefire boundary", "yellowline"),
+    ("MARKETS", "Dollar hits 19-month high, euro slips",
+     "Greenback climbs as euro slides", "dollar"),
 ]
 
-ALSO = [
+BRIEFS = [
     (14, "Carney-Trump talks end flat", "flag"),
     (15, "India, Japan hold 2+2 talks", "flag"),
     (16, "McDonald's workers win case", "check"),
@@ -900,182 +385,568 @@ ALSO = [
     (40, "Reliance eyes Starlink rival", "plane"),
 ]
 
+LAND = {
+    2: [(3, 8), (30, 33), (38, 52)],
+    3: [(2, 14), (28, 35), (36, 56)],
+    4: [(2, 16), (28, 34), (35, 57)],
+    5: [(3, 16), (29, 33), (36, 56)],
+    6: [(4, 15), (29, 34), (38, 54)],
+    7: [(5, 14), (30, 36), (40, 52)],
+    8: [(6, 13), (30, 37), (42, 50)],
+    9: [(7, 12), (30, 37), (44, 49)],
+    10: [(8, 12), (30, 36), (45, 48)],
+    11: [(9, 13), (30, 36), (46, 48)],
+    12: [(10, 15), (31, 35), (47, 49)],
+    13: [(10, 16), (31, 35)],
+    14: [(11, 16), (32, 34)],
+    15: [(11, 16), (32, 34), (50, 56)],
+    16: [(12, 15), (33, 34), (50, 57)],
+    17: [(12, 15), (50, 57)],
+    18: [(12, 14), (51, 56)],
+    19: [(13, 14)],
+    20: [(13, 13), (58, 59)],
+}
 
-# ---------------------------------------------------------------- layout
-def card(cv, x, y, w, story, art_h, head_cap, deck_cap, deck_lines=2):
-    """One illustrated card: art panel, badge, headline, deck. Returns height."""
-    cv.fill_rect(x, y, w, art_h, CARD_BG)
-    cv.set_clip(x, y, w, art_h)
-    PAINTERS[story["art"]](cv, x, y, w, art_h)
-    cv.clear_clip()
-    cv.frame(x, y, w, art_h, HAIRLINE, 1)
-    ty = y + art_h + 4
-    badge(cv, x + 2, ty, story["num"], story["region"])
-    ty += 18
-    bottom = draw_block(cv, "bold", story["headline"], x + 2, ty, head_cap, NAVY,
-                        w - 4, line_gap=1.16, max_lines=2)
-    ty = bottom + 3
-    if story.get("deck"):
-        bottom = draw_block(cv, "regular", story["deck"], x + 2, ty, deck_cap,
-                            GREY, w - 4, line_gap=1.16, max_lines=deck_lines)
-        ty = bottom + 2
-    return ty - y
-
-
-def paper_grain(cv, seed=987654321):
-    """Subtle deterministic newsprint grain on the bare paper.
-
-    Applied before anything is drawn, so type and art stay crisp on top.
-    A fixed-seed LCG perturbs roughly one pixel in four by -2..+2 levels
-    on all channels (brightness grain, hue preserved).
-    """
-    state = seed
-    px = cv.px
-    for i in range(0, len(px), 3):
-        state = (state * 1103515245 + 12345) & 0x7FFFFFFF
-        if state % 4 == 0:
-            d = ((state >> 10) % 5) - 2
-            if d:
-                px[i] = max(0, min(255, px[i] + d))
-                px[i + 1] = max(0, min(255, px[i + 1] + d))
-                px[i + 2] = max(0, min(255, px[i + 2] + d))
+RED_DOTS = [(50, 7), (37, 5), (8, 6), (46, 9), (30, 4), (44, 9), (9, 4),
+            (54, 6), (29, 4), (28, 5), (29, 6), (49, 12), (54, 17), (58, 20),
+            (48, 11), (60, 14), (38, 8), (33, 12), (34, 5), (42, 8), (44, 11)]
 
 
-def render():
-    cv = Canvas(PAGE_W, PAGE_H, PAPER)
-    paper_grain(cv)
+# --------------------------------------------------------------------------
+# Illustrations: flat shapes and gradients, one painter per story kind.
+# --------------------------------------------------------------------------
 
-    # --- masthead
-    draw_text(cv, "bold", "THE WORLD'S NEWS IN ONE PICTURE", MARGIN, 32, 15, RED_DARK)
+def paint_flag_china(s, x, y, w, h):
+    s.rect(x, y, w, h, (222, 32, 36))
+    s.star(x + w * 0.22, y + h * 0.30, max(2, h * 0.16), (255, 222, 0))
+    for dx, dy in ((0.42, 0.16), (0.48, 0.34), (0.48, 0.54), (0.42, 0.72)):
+        s.disc(x + w * dx, y + h * dy, max(1, h * 0.06), (255, 222, 0))
+
+
+def paint_flag_usa(s, x, y, w, h):
+    stripe = h / 7.0
+    for i in range(7):
+        s.rect(x, y + i * stripe, w, stripe + 1,
+               (198, 32, 44) if i % 2 == 0 else WHITE)
+    s.rect(x, y, w * 0.42, stripe * 4, (28, 48, 110))
+    for r in range(3):
+        for c in range(4):
+            s.disc(x + 3 + c * (w * 0.42 - 5) / 3, y + 3 + r * (stripe * 4 - 5) / 2,
+                   1, WHITE)
+
+
+def paint_flag_russia(s, x, y, w, h):
+    third = h / 3.0
+    s.rect(x, y, w, third + 1, WHITE)
+    s.rect(x, y + third, w, third + 1, (32, 84, 170))
+    s.rect(x, y + 2 * third, w, third + 1, (212, 32, 44))
+
+
+def paint_summit(s, x, y, w, h):
+    s.vgrad(x, y, w, h, (233, 239, 246), (212, 226, 240))
+    # skyline towers behind the table
+    towers = [(0.03, 0.30, 0.07), (0.13, 0.42, 0.08), (0.24, 0.34, 0.07),
+              (0.36, 0.46, 0.08), (0.48, 0.36, 0.07), (0.59, 0.44, 0.08),
+              (0.71, 0.33, 0.07), (0.82, 0.41, 0.08), (0.92, 0.30, 0.06)]
+    base = y + h * 0.72
+    for fx, fh, fw in towers:
+        tx, tw, th = x + w * fx, w * fw, h * fh
+        s.rect(tx, base - th, tw, th, (148, 168, 196))
+        for wy in range(int(base - th) + 4, int(base) - 3, 7):
+            for wx in range(int(tx) + 3, int(tx + tw) - 3, 6):
+                s.rect(wx, wy, 2, 3, (196, 212, 232))
+    # flags on poles above the three seats
+    flag_w, flag_h = w * 0.13, h * 0.30
+    painters = [paint_flag_china, paint_flag_usa, paint_flag_russia]
+    seats = [0.24, 0.50, 0.76]
+    for fx, painter in zip(seats, painters):
+        px = x + w * fx
+        s.rect(px - 1, y + h * 0.10, 2, h * 0.42, (90, 90, 90))
+        painter(s, px + 1, y + h * 0.10, flag_w, flag_h)
+    # long conference table
+    table_y = y + h * 0.66
+    s.rect(x + w * 0.06, table_y, w * 0.88, h * 0.07, (120, 78, 44))
+    s.rect(x + w * 0.06, table_y + h * 0.07, w * 0.88, 2, (92, 58, 30))
+    for fx in (0.10, 0.48, 0.86):
+        s.rect(x + w * fx, table_y + h * 0.09, 4, h * 0.10, (92, 58, 30))
+    # three seated figures: head, suit, tie
+    suits = [(44, 52, 84), (36, 36, 44), (60, 64, 78)]
+    for fx, suit in zip(seats, suits):
+        cx = x + w * fx + flag_w * 0.28
+        head_r = max(5, h * 0.095)
+        s.disc(cx, table_y - h * 0.17, head_r, (238, 200, 168))
+        s.rect(cx - head_r * 1.7, table_y - h * 0.17 + head_r * 0.6,
+               head_r * 3.4, h * 0.14, suit)
+        s.poly([(cx - 2, table_y - h * 0.13), (cx + 2, table_y - h * 0.13),
+                (cx, table_y - h * 0.05)], RED)
+    # water band along the bottom
+    s.rect(x, y + h * 0.86, w, h * 0.14, (86, 140, 196))
+    for i in range(9):
+        wx = x + (i * 67 % max(10, int(w) - 30))
+        s.rect(wx, y + h * (0.89 + 0.04 * (i % 2)), 22, 2, (150, 190, 226))
+
+
+def paint_bridge(s, x, y, w, h):
+    s.vgrad(x, y, w, h * 0.55, (214, 230, 244), (190, 214, 236))
+    s.rect(x, y + h * 0.55, w, h * 0.45, (66, 118, 186))
+    for i in range(7):
+        s.rect(x + (i * 53 % max(10, int(w) - 26)), y + h * (0.66 + 0.09 * (i % 3)),
+               18, 2, (130, 170, 220))
+    deck_y = y + h * 0.48
+    s.rect(x, deck_y, w, max(3, h * 0.07), (110, 116, 124))
+    for fx in (0.16, 0.50, 0.84):
+        tx = x + w * fx
+        s.rect(tx - 2, y + h * 0.14, 4, h * 0.38, (90, 96, 106))
+        s.line(tx, y + h * 0.16, tx - w * 0.15, deck_y, (90, 96, 106), 1)
+        s.line(tx, y + h * 0.16, tx + w * 0.15, deck_y, (90, 96, 106), 1)
+    # explosion burst mid-span with smoke
+    bx, by = x + w * 0.50, deck_y - h * 0.04
+    for dx, dy, r in ((-14, -12, 7), (12, -14, 8), (0, -20, 9), (-6, -26, 6)):
+        s.disc(bx + dx * w / 300, by + dy * h / 60, max(3, r * h / 60), (150, 150, 150))
+    s.star(bx, by, h * 0.30, (244, 120, 24), points=9)
+    s.star(bx, by, h * 0.19, (252, 190, 40), points=9)
+    s.disc(bx, by, max(2, h * 0.07), (255, 240, 180))
+
+
+def paint_bank(s, x, y, w, h, body, roof):
+    s.poly([(x, y + h * 0.22), (x + w / 2, y), (x + w, y + h * 0.22)], roof)
+    s.rect(x, y + h * 0.22, w, h * 0.08, roof)
+    cols = 5
+    for i in range(cols):
+        cx = x + w * (0.08 + 0.84 * i / (cols - 1)) - w * 0.035
+        s.rect(cx, y + h * 0.34, w * 0.07, h * 0.48, body)
+    s.rect(x - 2, y + h * 0.82, w + 4, h * 0.07, roof)
+    s.rect(x - 4, y + h * 0.89, w + 8, h * 0.06, roof)
+
+
+def paint_ipo(s, x, y, w, h):
+    s.vgrad(x, y, w, h, (14, 30, 64), (22, 48, 96))
+    paint_bank(s, x + w * 0.05, y + h * 0.18, w * 0.34, h * 0.66,
+               (222, 228, 238), (170, 182, 204))
+    pts = [(x + w * 0.46, y + h * 0.74), (x + w * 0.58, y + h * 0.60),
+           (x + w * 0.68, y + h * 0.66), (x + w * 0.80, y + h * 0.42),
+           (x + w * 0.93, y + h * 0.24)]
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        s.line(x0, y0, x1, y1, (52, 210, 110), max(2, int(h * 0.05)))
+    ex, ey = pts[-1]
+    s.poly([(ex, ey), (ex - w * 0.06, ey + h * 0.02), (ex - w * 0.015, ey + h * 0.14)],
+           (52, 210, 110))
+    for fx, fy in ((0.52, 0.82), (0.66, 0.80), (0.78, 0.58)):
+        cx, cy, r = x + w * fx, y + h * fy, max(5, h * 0.13)
+        s.disc(cx, cy, r, GOLD)
+        s.ring(cx, cy, r, (176, 128, 20), 1)
+        BOLD.stamp(s, "$", cx - BOLD.text_width("$", r * 1.15) / 2,
+                   cy + r * 0.42, r * 1.15, (120, 84, 8))
+
+
+def paint_icj(s, x, y, w, h):
+    s.vgrad(x, y, w, h, (238, 240, 244), (222, 228, 238))
+    paint_bank(s, x + w * 0.05, y + h * 0.16, w * 0.40, h * 0.70,
+               (240, 242, 246), (96, 108, 130))
+    # scales of justice
+    cx = x + w * 0.72
+    top = y + h * 0.16
+    s.rect(cx - 1, top, 3, h * 0.58, GOLD)
+    s.disc(cx, top, max(2, h * 0.05), GOLD)
+    s.line(cx - w * 0.17, top + h * 0.08, cx + w * 0.17, top + h * 0.08, GOLD, 2)
+    s.rect(cx - w * 0.05, top + h * 0.58, w * 0.10, h * 0.06, GOLD)
+    for side in (-1, 1):
+        px = cx + side * w * 0.17
+        py = top + h * 0.08
+        s.line(px, py, px - w * 0.05, py + h * 0.22, GOLD, 1)
+        s.line(px, py, px + w * 0.05, py + h * 0.22, GOLD, 1)
+        s.arc(px, py + h * 0.22, w * 0.055, 0, math.pi, GOLD, 2)
+        s.line(px - w * 0.055, py + h * 0.22, px + w * 0.055, py + h * 0.22, GOLD, 2)
+
+
+def paint_vangogh(s, x, y, w, h):
+    s.vgrad(x, y, w, h, (18, 30, 96), (30, 58, 150))
+    for fx, fy, r in ((0.16, 0.36, 0.20), (0.42, 0.30, 0.15), (0.66, 0.42, 0.18)):
+        s.arc(x + w * fx, y + h * fy, h * r, 0.3, 4.6, (110, 150, 220), 2)
+        s.arc(x + w * fx, y + h * fy, h * r * 0.62, 1.2, 5.6, (150, 180, 235), 1)
+    for fx, fy in ((0.10, 0.20), (0.30, 0.62), (0.54, 0.18), (0.80, 0.26), (0.92, 0.60)):
+        s.star(x + w * fx, y + h * fy, max(3, h * 0.09), (252, 214, 70), points=5)
+    mx, my, mr = x + w * 0.88, y + h * 0.30, max(5, h * 0.16)
+    s.disc(mx, my, mr, (252, 224, 120))
+    s.disc(mx + mr * 0.45, my - mr * 0.25, mr * 0.82, (24, 40, 110))
+    # gold price tag
+    tx, ty, tw, th = x + w * 0.58, y + h * 0.52, w * 0.38, h * 0.44
+    s.poly([(tx, ty + th / 2), (tx + tw * 0.16, ty), (tx + tw, ty),
+            (tx + tw, ty + th), (tx + tw * 0.16, ty + th)], (240, 196, 70))
+    s.disc(tx + tw * 0.13, ty + th / 2, max(2, th * 0.10), (30, 58, 150))
+    label = "$190M"
+    size = fit_size(BOLD, label, th * 0.62, tw * 0.72)
+    BOLD.stamp(s, label, tx + tw * 0.22, ty + th * 0.72, size, (60, 44, 4))
+
+
+def paint_cyclone(s, x, y, w, h):
+    s.vgrad(x, y, w, h * 0.68, (52, 64, 84), (86, 102, 128))
+    for i in range(16):
+        rx = x + (i * 37 % max(10, int(w) - 14))
+        ry = y + (i * 13 % max(8, int(h * 0.5)))
+        s.line(rx, ry, rx - 5, ry + h * 0.22, (190, 206, 226), 1)
+    cx, cy = x + w * 0.38, y + h * 0.36
+    for r, a0 in ((0.30, 0.4), (0.22, 1.4), (0.14, 2.4), (0.07, 3.4)):
+        s.arc(cx, cy, h * r, a0, a0 + 4.4, (226, 234, 244), 2)
+    s.disc(cx, cy, max(2, h * 0.045), (226, 234, 244))
+    wave_y = y + h * 0.68
+    pts = [(x, y + h)]
+    steps = 14
+    for i in range(steps + 1):
+        pts.append((x + w * i / steps, wave_y + math.sin(i * 1.7) * h * 0.07))
+    pts.append((x + w, y + h))
+    s.poly(pts, (30, 74, 128))
+    for i in range(steps + 1):
+        wx = x + w * i / steps
+        wy = wave_y + math.sin(i * 1.7) * h * 0.07
+        s.rect(wx - 4, wy - 1, 8, 2, (200, 224, 246))
+
+
+def paint_gta(s, x, y, w, h):
+    s.vgrad(x, y, w, h, (250, 110, 170), (252, 170, 80))
+    s.disc(x + w * 0.82, y + h * 0.52, h * 0.30, (255, 222, 110))
+    s.rect(x, y + h * 0.78, w, h * 0.22, (52, 30, 70))
+    for fx, lean in ((0.10, -0.06), (0.22, 0.05), (0.94, -0.04)):
+        bx = x + w * fx
+        top_x = bx + w * lean
+        top_y = y + h * 0.30
+        s.line(bx, y + h * 0.80, top_x, top_y, (40, 24, 56), max(2, int(h * 0.05)))
+        for ang in (-2.6, -1.9, -1.2, -0.5, 0.2):
+            ex = top_x + math.cos(ang) * w * 0.09
+            ey = top_y + math.sin(ang) * h * 0.30 + h * 0.10
+            s.line(top_x, top_y, ex, ey, (40, 24, 56), max(1, int(h * 0.035)))
+    label = "VICE CITY"
+    size = fit_size(BLACK, label, h * 0.34, w * 0.52)
+    lx = x + w * 0.30
+    ly = y + h * 0.62
+    BLACK.stamp(s, label, lx + 2, ly + 2, size, (255, 80, 190))
+    BLACK.stamp(s, label, lx, ly, size, (255, 246, 255))
+
+
+def paint_yacht(s, x, y, w, h):
+    s.vgrad(x, y, w, h * 0.58, (226, 238, 248), (206, 226, 242))
+    s.rect(x, y + h * 0.58, w, h * 0.42, (70, 126, 190))
+    hull_y = y + h * 0.60
+    s.poly([(x + w * 0.10, hull_y), (x + w * 0.92, hull_y),
+            (x + w * 0.84, hull_y + h * 0.20), (x + w * 0.18, hull_y + h * 0.20)],
+           WHITE)
+    s.rect(x + w * 0.30, hull_y - h * 0.16, w * 0.42, h * 0.16, WHITE)
+    s.rect(x + w * 0.38, hull_y - h * 0.27, w * 0.28, h * 0.11, WHITE)
+    s.line(x + w * 0.52, hull_y - h * 0.27, x + w * 0.52, hull_y - h * 0.42,
+           (120, 130, 140), 1)
+    for i in range(6):
+        s.disc(x + w * (0.24 + i * 0.10), hull_y + h * 0.08, max(1, h * 0.035),
+               (90, 120, 160))
+    for i in range(4):
+        s.rect(x + w * (0.34 + i * 0.09), hull_y - h * 0.12, w * 0.05, h * 0.07,
+               (120, 160, 205))
+    for i in range(6):
+        s.rect(x + (i * 47 % max(10, int(w) - 24)), y + h * (0.84 + 0.05 * (i % 2)),
+               16, 2, (160, 198, 232))
+
+
+def paint_tennis(s, x, y, w, h):
+    s.rect(x, y, w, h, (58, 138, 72))
+    inset = max(3, h * 0.10)
+    s.rect(x + inset, y + inset, w - 2 * inset, 2, WHITE)
+    s.rect(x + inset, y + h - inset - 2, w - 2 * inset, 2, WHITE)
+    s.rect(x + inset, y + inset, 2, h - 2 * inset, WHITE)
+    s.rect(x + w - inset - 2, y + inset, 2, h - 2 * inset, WHITE)
+    s.rect(x + w * 0.30, y + inset, 2, h - 2 * inset, WHITE)
+    s.rect(x + w * 0.70, y + inset, 2, h - 2 * inset, WHITE)
+    s.line(x + w * 0.30, y + h / 2, x + w * 0.70, y + h / 2, WHITE, 2)
+    s.rect(x + w * 0.495, y + inset * 0.4, max(3, w * 0.012), h - inset * 0.8,
+           (30, 60, 40))
+    s.rect(x + w * 0.495, y + inset * 0.4, max(3, w * 0.012), 2, WHITE)
+    bx, by = x + w * 0.78, y + h * 0.38
+    for t in range(9):
+        s.disc(bx - t * w * 0.028, by + math.sin(t * 0.5) * h * 0.05 - t * 0.6,
+               max(1, h * 0.05 - t * 0.4), (220, 235, 120))
+    s.disc(bx, by, max(3, h * 0.11), (214, 232, 60))
+    s.arc(bx, by, max(2, h * 0.08), -0.8, 1.4, WHITE, 1)
+
+
+def paint_datacentre(s, x, y, w, h):
+    s.vgrad(x, y, w, h, (16, 22, 38), (24, 34, 56))
+    s.rect(x, y + h * 0.84, w, h * 0.16, (30, 42, 66))
+    racks = 6
+    lights = [(80, 230, 140), (250, 190, 60), (90, 200, 250), (250, 120, 90)]
+    for i in range(racks):
+        rx = x + w * (0.04 + i * 0.16)
+        rw = w * 0.115
+        ry, rh = y + h * 0.12, h * 0.70
+        s.rect(rx, ry, rw, rh, (38, 50, 76))
+        s.rect(rx, ry, rw, 2, (70, 92, 130))
+        for row in range(5):
+            ly = ry + rh * (0.12 + row * 0.17)
+            s.rect(rx + 2, ly, rw - 4, 1, (58, 74, 104))
+            for dot in range(3):
+                s.disc(rx + rw * (0.22 + dot * 0.28), ly + rh * 0.07,
+                       max(1, h * 0.028), lights[(i + row + dot) % 4])
+
+
+def paint_satellite(s, x, y, w, h):
+    s.vgrad(x, y, w, h, (6, 8, 20), (14, 20, 40))
+    for i in range(26):
+        sx = x + (i * 61 % max(10, int(w) - 6)) + 3
+        sy = y + (i * 29 % max(8, int(h) - 6)) + 3
+        s.disc(sx, sy, 1, (210, 222, 245))
+    cx, cy = x + w * 0.50, y + h * 0.48
+    s.arc(cx, cy + h * 0.30, w * 0.42, math.pi * 1.12, math.pi * 1.88,
+          (120, 150, 200), 1)
+    panel_w, panel_h = w * 0.30, h * 0.30
+    for side in (-1, 1):
+        px = cx + side * w * 0.10 + (0 if side > 0 else -panel_w)
+        py = cy - panel_h / 2
+        s.rect(px, py, panel_w, panel_h, (44, 92, 180))
+        for gx in range(1, 4):
+            s.rect(px + panel_w * gx / 4, py, 1, panel_h, (110, 160, 225))
+        s.rect(px, py + panel_h / 2, panel_w, 1, (110, 160, 225))
+    s.rect(cx - w * 0.075, cy - h * 0.20, w * 0.15, h * 0.40, (216, 176, 80))
+    s.rect(cx - w * 0.075, cy - h * 0.20, w * 0.15, 2, (160, 124, 44))
+    s.disc(cx, cy + h * 0.30, max(3, h * 0.09), (226, 232, 240))
+    s.line(cx, cy + h * 0.20, cx, cy + h * 0.24, (226, 232, 240), 2)
+
+
+def paint_yellowline(s, x, y, w, h):
+    s.vgrad(x, y, w, h * 0.62, (240, 228, 196), (232, 214, 170))
+    s.rect(x, y + h * 0.62, w, h * 0.38, (214, 190, 140))
+    fence_y = y + h * 0.30
+    posts = 9
+    for i in range(posts):
+        px = x + w * (0.04 + 0.92 * i / (posts - 1))
+        s.rect(px - 1, fence_y, 3, h * 0.42, (96, 84, 64))
+    for fy in (0.08, 0.20, 0.32):
+        s.line(x + w * 0.04, fence_y + h * fy, x + w * 0.96, fence_y + h * fy,
+               (120, 108, 84), 1)
+    s.rect(x, y + h * 0.52, w, max(3, h * 0.09), (250, 198, 24))
+    s.rect(x, y + h * 0.52, w, 1, (210, 160, 10))
+
+
+def paint_dollar(s, x, y, w, h):
+    s.vgrad(x, y, w, h, (24, 110, 62), (34, 140, 80))
+    cx, cy, r = x + w * 0.20, y + h * 0.52, h * 0.34
+    s.disc(cx, cy, r, (244, 200, 64))
+    s.ring(cx, cy, r, (190, 146, 28), 2)
+    s.ring(cx, cy, r * 0.78, (214, 168, 40), 1)
+    BOLD.stamp(s, "$", cx - BOLD.text_width("$", r * 1.25) / 2, cy + r * 0.45,
+               r * 1.25, (140, 104, 10))
+    ax0, ay0 = x + w * 0.42, y + h * 0.66
+    ax1, ay1 = x + w * 0.70, y + h * 0.34
+    s.line(ax0, ay0, ax1, ay1, (120, 240, 160), max(3, int(h * 0.10)))
+    s.poly([(ax1, ay1), (ax1 - w * 0.10, ay1 + h * 0.02),
+            (ax1 - w * 0.02, ay1 + h * 0.20)], (120, 240, 160))
+    ex, ey, er = x + w * 0.88, y + h * 0.56, h * 0.24
+    s.disc(ex, ey, er, (220, 226, 232))
+    s.ring(ex, ey, er, (160, 170, 182), 2)
+    BOLD.stamp(s, "€", ex - BOLD.text_width("€", er * 1.2) / 2, ey + er * 0.42,
+               er * 1.2, (90, 100, 116))
+
+
+PAINTERS = {
+    "summit": paint_summit, "bridge": paint_bridge, "ipo": paint_ipo,
+    "icj": paint_icj, "vangogh": paint_vangogh, "cyclone": paint_cyclone,
+    "gta": paint_gta, "yacht": paint_yacht, "tennis": paint_tennis,
+    "datacentre": paint_datacentre, "satellite": paint_satellite,
+    "yellowline": paint_yellowline, "dollar": paint_dollar,
+}
+
+
+def paint_band(s, kind, x, y, w, h):
+    s.set_clip(x, y, x + w, y + h)
+    PAINTERS[kind](s, x, y, w, h)
+    s.clear_clip()
+    s.rect(x, y, w, 1, HAIR)
+    s.rect(x, y + h - 1, w, 1, HAIR)
+    s.rect(x, y, 1, h, HAIR)
+    s.rect(x + w - 1, y, 1, h, HAIR)
+
+
+# --------------------------------------------------------------------------
+# Small parts: number badges, the dotted map, brief icons, story cards.
+# --------------------------------------------------------------------------
+
+def number_badge(s, number, cx, cy, r):
+    s.disc(cx, cy, r, RED)
+    label = str(number)
+    size = r * 1.15 if len(label) == 1 else r * 0.92
+    BOLD.stamp(s, label, cx - BOLD.text_width(label, size) / 2,
+               cy + size * 0.36, size, WHITE)
+
+
+def region_line(s, number, region, x, baseline, badge_r, size):
+    number_badge(s, number, x + badge_r, baseline - size * 0.36, badge_r)
+    BOLD.stamp(s, region, x + badge_r * 2 + 5, baseline, size, RED)
+
+
+def paint_map(s, x, y, w, h):
+    cols, rows = 62, 19
+    sx = w / cols
+    sy = h / rows
+    for gy, spans in LAND.items():
+        for a, b in spans:
+            for gx in range(a, b + 1):
+                s.disc(x + (gx + 0.5) * sx, y + (gy - 2 + 0.5) * sy, 1.6,
+                       (176, 168, 150))
+    for gx, gy in RED_DOTS:
+        s.disc(x + (gx + 0.5) * sx, y + (gy - 2 + 0.5) * sy, 2.7, RED)
+
+
+def brief_icon(s, kind, cx, cy, size):
+    half = size / 2
+    if kind == "flag":
+        s.line(cx - half * 0.6, cy - half, cx - half * 0.6, cy + half, NAVY, 1)
+        s.poly([(cx - half * 0.6, cy - half), (cx + half, cy - half * 0.55),
+                (cx - half * 0.6, cy - half * 0.1)], RED)
+    elif kind == "check":
+        s.line(cx - half, cy, cx - half * 0.25, cy + half * 0.7, RED, 2)
+        s.line(cx - half * 0.25, cy + half * 0.7, cx + half, cy - half * 0.7, RED, 2)
+    elif kind == "house":
+        s.poly([(cx - half, cy - half * 0.1), (cx, cy - half),
+                (cx + half, cy - half * 0.1)], NAVY)
+        s.rect(cx - half * 0.7, cy - half * 0.1, half * 1.4, half * 1.05, NAVY)
+        s.rect(cx - half * 0.22, cy + half * 0.35, half * 0.44, half * 0.6, PAPER)
+    elif kind == "cross":
+        s.rect(cx - half * 0.28, cy - half, half * 0.56, size, RED)
+        s.rect(cx - half, cy - half * 0.28, size, half * 0.56, RED)
+    elif kind == "drop":
+        s.poly([(cx, cy - half), (cx + half * 0.75, cy + half * 0.25),
+                (cx - half * 0.75, cy + half * 0.25)], (52, 120, 200))
+        s.disc(cx, cy + half * 0.25, half * 0.72, (52, 120, 200))
+    elif kind == "gear":
+        for k in range(6):
+            a = k * math.pi / 3
+            s.line(cx, cy, cx + half * math.cos(a), cy + half * math.sin(a), NAVY, 2)
+        s.disc(cx, cy, half * 0.55, NAVY)
+        s.disc(cx, cy, half * 0.24, PAPER)
+    elif kind == "star":
+        s.star(cx, cy, half, GOLD)
+    elif kind == "coin":
+        s.disc(cx, cy, half * 0.9, GOLD)
+        s.ring(cx, cy, half * 0.9, (176, 128, 20), 1)
+        BOLD.stamp(s, "$", cx - BOLD.text_width("$", size * 0.8) / 2,
+                   cy + size * 0.29, size * 0.8, (120, 84, 8))
+    elif kind == "bolt":
+        s.poly([(cx + half * 0.25, cy - half), (cx - half * 0.55, cy + half * 0.15),
+                (cx - half * 0.05, cy + half * 0.15), (cx - half * 0.25, cy + half),
+                (cx + half * 0.55, cy - half * 0.15), (cx + half * 0.05, cy - half * 0.15)],
+               GOLD)
+    elif kind == "ball":
+        s.disc(cx, cy, half * 0.9, WHITE)
+        s.ring(cx, cy, half * 0.9, NAVY, 1)
+        s.arc(cx, cy, half * 0.55, -0.9, 0.9, NAVY, 1)
+        s.arc(cx, cy, half * 0.55, math.pi - 0.9, math.pi + 0.9, NAVY, 1)
+    elif kind == "plane":
+        s.poly([(cx + half, cy), (cx - half * 0.2, cy - half * 0.25),
+                (cx - half * 0.55, cy - half * 0.85), (cx - half * 0.75, cy - half * 0.2),
+                (cx - half, cy + half * 0.15), (cx - half * 0.55, cy + half * 0.35),
+                (cx - half * 0.35, cy + half * 0.85), (cx - half * 0.05, cy + half * 0.3)],
+               NAVY)
+
+
+def story_card(s, number, story, x, y, w, band_h, head_size, deck_size,
+               region_size, badge_r, deck_lines=2):
+    region, headline, deck, kind = story
+    paint_band(s, kind, x, y, w, band_h)
+    base = y + band_h + region_size + 7
+    region_line(s, number, region, x, base, badge_r, region_size)
+    head_lines = BOLD.wrap(headline, head_size, w, 2)
+    y_after = stamp_lines(s, BOLD, head_lines, x, base + head_size + 6,
+                          head_size, NAVY, head_size * 1.12)
+    deck_wrapped = REGULAR.wrap(deck, deck_size, w, deck_lines)
+    stamp_lines(s, REGULAR, deck_wrapped, x, y_after + deck_size * 0.55,
+                deck_size, GREY, deck_size * 1.18)
+
+
+# --------------------------------------------------------------------------
+# Page assembly.
+# --------------------------------------------------------------------------
+
+def build_page():
+    s = Sheet(PAGE_W, PAGE_H, PAPER)
+
+    # kicker line
+    BOLD.stamp(s, "THE WORLD'S NEWS IN ONE PICTURE", MARGIN, 34, 17, RED)
     right = "40 STORIES · FIVE CONTINENTS"
-    rw = text_width("bold", right, 12.5)
-    draw_text(cv, "bold", right, PAGE_W - MARGIN - rw, 32, 12.5, GREY)
+    BOLD.stamp(s, right, MARGIN + CONTENT_W - BOLD.text_width(right, 14.5),
+               34, 14.5, GREY)
+
+    # masthead title and rule
     title = "THURSDAY 19 NOVEMBER 2026"
-    cap = fit_cap("black", title, CONTENT_W, cap_hi=90)
-    draw_text(cv, "black", title, MARGIN, 44 + cap, cap, NAVY)
-    rule_y = int(44 + cap + 10)
-    cv.hline(MARGIN, rule_y, CONTENT_W, RED, 3)
+    tsize = fit_size(BLACK, title, 66, CONTENT_W)
+    BLACK.stamp(s, title, MARGIN, 96, tsize, NAVY)
+    s.rect(MARGIN, 106, CONTENT_W, 6, NAVY)
 
-    # --- lead + map
-    lead_y = rule_y + 9
-    art_w, art_h = 624, 108
-    cv.set_clip(MARGIN, lead_y, art_w, art_h)
-    PAINTERS[LEAD["art"]](cv, MARGIN, lead_y, art_w, art_h)
-    cv.clear_clip()
-    cv.frame(MARGIN, lead_y, art_w, art_h, HAIRLINE, 1)
-    map_x = MARGIN + art_w + 16
-    map_w = PAGE_W - MARGIN - map_x
-    draw_map(cv, map_x, lead_y + 7, map_w, art_h - 30)
+    # lead story (left) and map (right)
+    lead_w = 592
+    map_x = MARGIN + lead_w + 16
+    map_w = CONTENT_W - lead_w - 16
+    paint_band(s, "summit", MARGIN, 122, lead_w, 88)
+    region, headline, deck = LEAD
+    region_line(s, 1, region, MARGIN, 230, 9, 14)
+    head_lines = BOLD.wrap(headline, 34, lead_w, 2)
+    after = stamp_lines(s, BOLD, head_lines, MARGIN, 260, 34, NAVY, 35)
+    deck_lines = REGULAR.wrap(deck, 14.5, lead_w, 2)
+    stamp_lines(s, REGULAR, deck_lines, MARGIN, after + 2, 14.5, GREY, 16.5)
+
+    paint_map(s, map_x, 126, map_w, 128)
     cap1 = "WHERE IT HAPPENED"
-    draw_text(cv, "bold", cap1, map_x + (map_w - text_width("bold", cap1, 11)) / 2,
-              lead_y + art_h - 12, 11, NAVY)
+    BOLD.stamp(s, cap1, map_x + (map_w - BOLD.text_width(cap1, 14)) / 2,
+               284, 14, NAVY)
     cap2 = "RED DOTS MARK THE BIG STORIES"
-    draw_text(cv, "regular", cap2,
-              map_x + (map_w - text_width("regular", cap2, 8.5)) / 2,
-              lead_y + art_h - 1, 8.5, GREY)
-    ly = lead_y + art_h + 6
-    badge(cv, MARGIN + 2, ly, LEAD["num"], LEAD["region"])
-    ly += 19
-    bottom = draw_block(cv, "bold", LEAD["headline"], MARGIN + 2, ly, 26, NAVY,
-                        art_w - 4, line_gap=1.16, max_lines=2)
-    ly = bottom + 4
-    bottom = draw_block(cv, "regular", LEAD["deck"], MARGIN + 2, ly, 12, GREY,
-                        art_w - 4, line_gap=1.16, max_lines=2)
-    lead_bottom = bottom + 4
+    REGULAR.stamp(s, cap2, map_x + (map_w - REGULAR.text_width(cap2, 10.5)) / 2,
+                  300, 10.5, GREY)
 
-    # --- featured row (3 cards)
-    fy = lead_bottom + 2
-    col_w = (CONTENT_W - 2 * 20) // 3
-    heights = []
+    s.rect(MARGIN, 356, CONTENT_W, 1, HAIR)
+
+    # featured row: stories 2-4
+    col_w = 314
+    gap = (CONTENT_W - 3 * col_w) // 2
     for i, story in enumerate(FEATURED):
-        cx = MARGIN + i * (col_w + 20)
-        heights.append(card(cv, cx, fy, col_w, story, 68, 16.5, 11, deck_lines=2))
-    feat_bottom = fy + max(heights) + 4
-    cv.hline(MARGIN, feat_bottom, CONTENT_W, HAIRLINE, 1)
+        story_card(s, i + 2, story, MARGIN + i * (col_w + gap), 364, col_w,
+                   band_h=50, head_size=20, deck_size=12, region_size=12,
+                   badge_r=8)
 
-    # --- illustrated grid (3 x 3)
-    gy = feat_bottom + 6
-    row_heights = []
+    s.rect(MARGIN, 518, CONTENT_W, 1, HAIR)
+
+    # grid: stories 5-13 in three rows
     for row in range(3):
-        row_h = 0
         for col in range(3):
-            story = GRID[row * 3 + col]
-            cx = MARGIN + col * (col_w + 20)
-            h = card(cv, cx, gy, col_w, story, 46, 15, 10, deck_lines=1)
-            row_h = max(row_h, h)
-        row_heights.append(row_h)
-        gy += row_h + 6
-    grid_bottom = gy - 6
-    cv.hline(MARGIN, grid_bottom + 2, CONTENT_W, HAIRLINE, 1)
+            idx = row * 3 + col
+            story_card(s, idx + 5, GRID[idx], MARGIN + col * (col_w + gap),
+                       526 + row * 100, col_w, band_h=28, head_size=16.5,
+                       deck_size=10.5, region_size=11, badge_r=7)
 
-    # --- ALSO block (4 columns)
-    ay = grid_bottom + 8
-    draw_text(cv, "bold", "ALSO ON 19 NOVEMBER", MARGIN, ay + 15, 15, RED_DARK)
-    ay += 18
-    cv.hline(MARGIN, ay, CONTENT_W, RED, 2)
-    ay += 4
-    also_cols = 4
-    also_w = (CONTENT_W - (also_cols - 1) * 12) // also_cols
-    row_h = 14
-    for i, (num, headline, icon) in enumerate(ALSO):
-        col = i % also_cols
-        row = i // also_cols
-        ix = MARGIN + col * (also_w + 12)
-        iy = ay + row * row_h
-        draw_text(cv, "bold", str(num), ix, iy + 10, 9, RED_DARK)
-        mini_icon(cv, ix + 16, iy + 1, icon, NAVY)
-        draw_text(cv, "bold", headline, ix + 30, iy + 10.5, 10, NAVY)
-    also_bottom = ay + ((len(ALSO) + also_cols - 1) // also_cols) * row_h
+    # briefs header and four columns of one-liners
+    BOLD.stamp(s, "ALSO ON 19 NOVEMBER", MARGIN, 838, 17, RED)
+    brief_col_w = CONTENT_W // 4
+    for i, (number, text, icon) in enumerate(BRIEFS):
+        col, row = i % 4, i // 4
+        bx = MARGIN + col * brief_col_w
+        by = 856 + row * 15
+        label = str(number)
+        BOLD.stamp(s, label, bx, by, 11, RED)
+        brief_icon(s, icon, bx + 24, by - 4, 10)
+        size = fit_size(REGULAR, text, 11, brief_col_w - 36, floor=9.0)
+        REGULAR.stamp(s, text, bx + 33, by, size, NAVY)
 
-    # --- footer
-    fy2 = also_bottom + 6
-    cv.hline(MARGIN, fy2, CONTENT_W, HAIRLINE, 1)
-    draw_text(cv, "black", "AND FINALLY: BABOON-HUNTING EAGLES AND A BALANCING TRACTOR",
-              MARGIN, fy2 + 20, 15, NAVY)
+    # footer lines
+    finale = "AND FINALLY: BABOON-HUNTING EAGLES AND A BALANCING TRACTOR"
+    fsize = fit_size(BOLD, finale, 18, CONTENT_W)
+    BOLD.stamp(s, finale, MARGIN, 968, fsize, NAVY)
     sources = ("Every story reported on Thursday 19 November 2026 · Sources: "
                "Reuters, BBC, NYT, AP, The Guardian, NDTV, AFP, AAP, Global Voices")
-    draw_text(cv, "regular", sources, MARGIN, fy2 + 34, 9.5, GREY)
-    if os.environ.get("NEWS_DEBUG"):
-        print(f"layout: rule={rule_y} lead_bottom={lead_bottom} "
-              f"feat_bottom={feat_bottom} grid_bottom={grid_bottom} "
-              f"also_bottom={also_bottom} footer_end={fy2 + 40}")
-    return cv
-
-
-def write_png(path, cv):
-    raw = bytearray()
-    stride = cv.w * 3
-    for yy in range(cv.h):
-        raw.append(0)
-        raw += cv.px[yy * stride:(yy + 1) * stride]
-    comp = zlib.compress(bytes(raw), 9)
-
-    def chunk(kind, data):
-        return (struct.pack(">I", len(data)) + kind + data +
-                struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
-
-    ihdr = struct.pack(">IIBBBBB", cv.w, cv.h, 8, 2, 0, 0, 0)
-    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) +
-           chunk(b"IDAT", comp) + chunk(b"IEND", b""))
-    Path(path).write_bytes(png)
-    return len(png)
-
-
-def output_path():
-    env = os.environ.get("MAKEFUN_OUTPUT_DIR")
-    if env:
-        return Path(env) / "entry.png"
-    if Path("/output").is_dir():
-        return Path("/output/entry.png")
-    return Path(__file__).resolve().parent / "entry.png"
+    ssize = fit_size(REGULAR, sources, 11, CONTENT_W)
+    REGULAR.stamp(s, sources, MARGIN, 986, ssize, GREY)
+    return s
 
 
 def main():
-    cv = render()
-    out = output_path()
-    out.parent.mkdir(parents=True, exist_ok=True)
-    size = write_png(out, cv)
-    print(f"wrote {out} ({size} bytes)")
+    page = build_page()
+    target = output_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(png_bytes(page))
+    print(f"wrote {target}")
 
 
 if __name__ == "__main__":
