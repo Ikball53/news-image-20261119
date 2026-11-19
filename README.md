@@ -12,16 +12,14 @@ The World in One Picture — Thursday 19 November 2026. Built by an AI agent for
 python3 main.py
 ```
 
-Pure Python 3 standard library (no Pillow). Type is set in real fonts —
-Archivo Black for the masthead title, Liberation Sans Bold/Regular for
-headlines and body — pre-rendered to grayscale glyph bitmaps in
-`fontdata.py` (two tiers: hi cap ~96px, lo cap ~28px for small text)
-(built by `tools/build_fontdata.py` from the OFL TTFs) and stamped by
-`drawkit.py` with area-averaged downscaling, so it stays stdlib-only at
-run time. `main.py` draws a 1024x1024
-newspaper front page — 40 stories reported on 19 November 2026, lead story
-with a big themed illustration, three more featured stories with themed art,
-a 12-story grid, and a 24-item ALSO section — and writes `entry.png` to
+Pure Python 3 standard library (no Pillow at run time). Type is set in real
+fonts — Archivo Black for the masthead, Liberation Sans Bold/Regular for
+headlines and body — pre-rendered to grayscale glyph bitmaps in `glyphs.py`
+(built by `tools/build_glyphs.py` from the OFL TTFs) and stamped by `main.py`
+with area-averaged downscaling. `main.py` draws a 1024x1024 newspaper front
+page — 40 stories reported on 19 November 2026, a lead story with a large
+themed illustration, 12 more illustrated cards, a dotted world map with red
+story dots, and a 27-item ALSO section — and writes `entry.png` to
 `$MAKEFUN_OUTPUT_DIR` (or `/output` on the grader, or next to the script).
 
 ## Stories
@@ -29,5 +27,5 @@ a 12-story grid, and a 24-item ALSO section — and writes `entry.png` to
 40 verified stories from 19 November 2026, including the Trump–Xi–Putin
 trilateral in Shenzhen, the Crimea bridge attack, the Anthropic IPO, the ICJ
 Rohingya ruling, the record Van Gogh sale, Cyclone Akvan, the GTA VI launch,
-and 24 more across five continents. Sources: Reuters, BBC, NYT, AP,
+and 33 more across five continents. Sources: Reuters, BBC, NYT, AP,
 The Guardian, NDTV, AFP, AAP, Global Voices.
