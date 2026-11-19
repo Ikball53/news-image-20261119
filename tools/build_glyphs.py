@@ -1,93 +1,98 @@
-"""Build-time tool: pre-render real TTF glyphs to grayscale bitmaps.
+#!/usr/bin/env python3
+"""Bake the three newspaper typefaces into compact grayscale glyph tables.
 
-Reads Archivo Black (OFL, in fonts-src/) and Liberation Sans Bold/Regular
-(system fonts, OFL) with Pillow and writes glyphs.py next to main.py.
-The runtime (main.py) is pure stdlib: it decompresses the bitmaps and
-stamps them with area-averaged downscaling, so no font files or Pillow
-are needed on the grader.
-
-Each glyph is rendered at a generous pixel size so runtime downscaling
-stays smooth. Data layout per font:
-  {"cap": cap_height_px, "glyphs": {char: [advance, w, h, xoff, yoff, bytes]}}
-where yoff is the distance from the baseline up to the glyph top.
-The whole dict is pickled with a fixed protocol, zlib-compressed and
-base64-encoded into one string so the data file stays compact.
+The graded program may only use the Python standard library, so the real
+TrueType faces are rendered here, once, at a generous size.  Each glyph is
+stored as a small grayscale bitmap plus its advance width and ink offsets.
+Everything is packed into one zlib-compressed blob per face and written to
+glyphs.py as a handful of very long base64 lines.  At run time the entry
+program decodes those blobs and stamps scaled copies of the bitmaps.
 """
 
 import base64
-import pickle
+import json
+import struct
 import zlib
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
 ROOT = Path(__file__).resolve().parent.parent
-SYSTEM_FONT_DIR = Path("/usr/share/fonts/truetype/liberation")
+OUT = ROOT / "glyphs.py"
 
-# Characters we may ever set: printable ASCII plus a few typographic marks.
-EXTRA_CHARS = "—–·’‘“”…€"  # em/en dash, middot, quotes, ellipsis, euro
-CHARSET = "".join(chr(c) for c in range(32, 127)) + EXTRA_CHARS
+RENDER_PX = 80  # master size every glyph bitmap is rendered at
 
-def _archivo_path() -> Path:
-    candidates = (
-        ROOT / "fonts-src" / "ArchivoBlack-Regular.ttf",
-        ROOT.parent / "news-image-20261119-v4-fonts" / "ArchivoBlack-Regular.ttf",
-    )
-    for cand in candidates:
-        if cand.exists():
-            return cand
-    return candidates[0]
-
-
-FONTS = {
-    "black": (_archivo_path(), 140),
-    "bold": (SYSTEM_FONT_DIR / "LiberationSans-Bold.ttf", 72),
-    "regular": (SYSTEM_FONT_DIR / "LiberationSans-Regular.ttf", 56),
+FACES = {
+    "black": Path.home() / "workspace/makefun/news-image-20261119-v4-fonts/ArchivoBlack-Regular.ttf",
+    "bold": Path("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"),
+    "regular": Path("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
 }
 
+EXTRA_CHARS = "·—’‘“”€£¥•…–«»©°×÷±¼½¾←→↑↓★☆✓✗"
+CHARSET = "".join(chr(c) for c in range(32, 127)) + EXTRA_CHARS
 
-def render_font(path: Path, size: int) -> dict:
-    font = ImageFont.truetype(str(path), size)
+
+def render_face(path):
+    """Render every wanted character of one face into a JSON-able dict."""
+    font = ImageFont.truetype(str(path), RENDER_PX)
     ascent, descent = font.getmetrics()
-    # Cap height: measure the letter H.
-    probe = Image.new("L", (size * 2, size * 2), 0)
-    ImageDraw.Draw(probe).text((size // 2, size // 2), "H", font=font, fill=255)
-    bbox = probe.getbbox()
-    cap = bbox[3] - bbox[1]
-    glyphs = {}
+    table = {}
     for ch in CHARSET:
-        advance = int(round(font.getlength(ch)))
-        canvas = Image.new("L", (size * 2, size * 2), 0)
-        draw = ImageDraw.Draw(canvas)
-        origin_x, origin_y = size // 2, size // 2
-        draw.text((origin_x, origin_y), ch, font=font, fill=255)
-        box = canvas.getbbox()
-        if box is None:  # space and friends: no ink
-            glyphs[ch] = [advance, 0, 0, 0, 0, b""]
+        advance = font.getlength(ch)
+        # Draw on an oversized scratch canvas, then crop to the ink.
+        scratch = Image.new("L", (RENDER_PX * 3, RENDER_PX * 3), 0)
+        pen = ImageDraw.Draw(scratch)
+        pen.text((RENDER_PX, RENDER_PX), ch, font=font, fill=255)
+        box = scratch.getbbox()
+        if box is None:  # space and friends carry no ink
+            table[ch] = [round(advance * 64), 0, 0, 0, 0, ""]
             continue
-        crop = canvas.crop(box)
-        xoff = box[0] - origin_x
-        # Baseline sits at origin_y + ascent; yoff = baseline - top.
-        yoff = origin_y + ascent - box[1]
-        glyphs[ch] = [advance, crop.width, crop.height, xoff, yoff, crop.tobytes()]
-    return {"cap": cap, "size": size, "glyphs": glyphs}
+        left, top, right, bottom = box
+        ink = scratch.crop(box)
+        table[ch] = [
+            round(advance * 64),
+            ink.width,
+            ink.height,
+            left - RENDER_PX,
+            top - RENDER_PX,
+            base64.b64encode(ink.tobytes()).decode("ascii"),
+        ]
+    return {"ascent": ascent, "descent": descent, "glyphs": table}
 
 
-def main() -> None:
-    data = {name: render_font(path, size) for name, (path, size) in FONTS.items()}
-    blob = base64.b64encode(zlib.compress(pickle.dumps(data, protocol=4), 9)).decode("ascii")
-    # Long chunks keep the generated module to a handful of lines.
-    lines = [blob[i:i + 8192] for i in range(0, len(blob), 8192)]
-    out = ROOT / "glyphs.py"
-    with out.open("w", encoding="utf-8") as fh:
-        fh.write('"""Pre-rendered glyph bitmaps (Archivo Black + Liberation Sans, OFL).\n\n')
-        fh.write("Generated by tools/build_glyphs.py. Do not edit by hand.\n")
-        fh.write('"""\n\n')
-        fh.write("BLOB = (\n")
-        for line in lines:
-            fh.write(f'    "{line}"\n')
-        fh.write(")\n")
-    print(f"wrote {out} ({out.stat().st_size} bytes)")
+def pack_face(face):
+    """Serialise one face dict to a single base64 string."""
+    raw = json.dumps(face, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.b64encode(zlib.compress(raw, 9)).decode("ascii")
+
+
+def main():
+    chunks = []
+    for name, path in FACES.items():
+        if not path.exists():
+            raise SystemExit(f"font missing: {path}")
+        chunks.append((name, pack_face(render_face(path))))
+        print(f"{name}: rendered from {path.name}")
+
+    lines = [
+        '"""Pre-rendered glyph bitmaps for the three newspaper faces.',
+        "",
+        "Generated by tools/build_glyphs.py.  Each value is a zlib-compressed,",
+        "base64-wrapped JSON table: character -> [advance*64, width, height,",
+        "x offset, y offset, base64 grayscale bitmap].  Bitmaps were rendered",
+        f"at {RENDER_PX}px; the entry program scales them down while stamping.",
+        '"""',
+        "",
+        f"RENDER_PX = {RENDER_PX}",
+        "",
+        "FACES = {",
+    ]
+    for name, blob in chunks:
+        lines.append(f'    "{name}": "{blob}",')
+    lines.append("}")
+    lines.append("")
+    OUT.write_text("\n".join(lines), encoding="utf-8")
+    print(f"wrote {OUT} ({OUT.stat().st_size} bytes, {len(lines)} lines)")
 
 
 if __name__ == "__main__":
