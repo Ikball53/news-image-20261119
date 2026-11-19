@@ -1,258 +1,231 @@
-#!/usr/bin/env python3
-"""News image entry: Thursday 19 November 2026 — 16 stories, 4 continents.
-Pure Python standard library. Deterministic: no randomness, no clock, no
-network. Composites the pre-rendered RGBA assets in assets/ onto a cream
-front page and writes entry.png to $MAKEFUN_OUTPUT_DIR (or /output).
-"""
-import binascii
+# main.py — "The World in One Picture", Thursday 19 November 2026.
+# Pure stdlib (no Pillow): draws a 1024x1024 newspaper front page with
+# drawkit.py and writes entry.png to $MAKEFUN_OUTPUT_DIR (or /output).
+# Deterministic: no time, no randomness, no network.
 import os
-import struct
 import sys
-import zlib
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-ASSETS = os.path.join(HERE, "assets")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from drawkit import (Canvas, CREAM, CREAM2, PAPER, NAVY, NAVY2, RED, RED2,
+                     INK, GREY, LGREY, BORDER, GOLD, text_width, wrap_text,
+                     draw_icon, draw_map, art_summit, art_bridge, art_ipo,
+                     art_court)
 
 W, H = 1024, 1024
-CREAM = (247, 242, 228)
-WHITE = (255, 255, 255)
-NAVY = (26, 35, 64)
-CARD_BORDER = (229, 221, 200)
-PAGE_BORDER = (216, 208, 188)
+
+# ---------------------------------------------------------------- stories --
+# (num, region, headline, summary, icon, art)
+# Sentence case like the 13 Nov example: bold headlines, regular
+# summaries. Only masthead/tags/headers stay all-caps.
+LEAD = (1, 'CHINA',
+        'Trump, Xi and Putin meet in Shenzhen',
+        'First three-way summit of the nuclear powers opens the APEC '
+        'meeting, with arms control and trade on the table',
+        'globe', 'summit')
+
+FEATURED = [
+    (2, 'UKRAINE',
+     'Crimea bridge hit again as blasts rock span',
+     'New video shows explosions before part collapses',
+     'storm', 'bridge'),
+    (3, 'UNITED STATES',
+     'Anthropic prices IPO at $83 a share',
+     "Claude maker's debut is the year's biggest listing",
+     'chart', 'ipo'),
+    (4, 'MYANMAR',
+     'ICJ rules on Rohingya genocide case',
+     'Court decides if 2017 army campaign was genocide',
+     'court', 'court'),
+]
+
+GRID = [
+    (5, 'NETHERLANDS',
+     'Van Gogh sells for record $190.4M',
+     'Painting fetches top price after Nazi-row sale', 'sun'),
+    (6, 'INDIA',
+     'Cyclone Akvan bears down on India',
+     'Storm surge feared as East Coast braces', 'storm'),
+    (7, 'CANADA',
+     'Carney and Trump end with no deal',
+     'Trade talks stall as tariffs stay in place', 'people'),
+    (8, 'JAPAN',
+     'India and Japan hold 2+2 talks in Tokyo',
+     'Defence ties top agenda at ministerial meeting', 'plane'),
+    (9, 'UNITED KINGDOM',
+     'Bayesian report blames high winds',
+     'Superyacht had flaw no one spotted, inquiry finds', 'yacht'),
+    (10, 'UNITED KINGDOM',
+     "McDonald's workers win tribunal fight",
+     'Staff can sue over abuse claims, judge rules', 'briefcase'),
+    (11, 'IRELAND',
+     'UK and Ireland meet in Dublin',
+     'Leaders talk trade, borders and peace', 'people'),
+    (12, 'SPAIN',
+     'Italy face Ukraine in BJK Cup semis',
+     'Seville hosts the last-four showdown', 'tennis'),
+    (13, 'INDONESIA',
+     'Prabowo at ASEAN summit in Manila',
+     'Leaders gather as trade tops the agenda', 'podium'),
+    (14, 'UNITED KINGDOM',
+     'Commonhold bill goes to Parliament',
+     'Leasehold reform finally reaches MPs', 'parliament'),
+    (15, 'AUSTRALIA',
+     'Nine new data centres planned',
+     'Power and water fears grow in the regions', 'server'),
+    (16, 'WORLDWIDE',
+     'GTA VI unlocks at midnight in NZ',
+     'Gamers enter Vice City as rollout begins', 'gamepad'),
+]
+
+# ALSO items: ONE-LINE bold headlines only (round 5: the 4-col x 6-row
+# block of 2-line tiny text read as a dense grey blur at phone size —
+# "acak-acakan". Now 3 cols x 8 rows, same rhythm as the example's
+# grid, one clean bold line per row, generous row height). Headlines
+# shortened to fit one line in a ~320px column at scale 1.5 bold
+# (verified with text_width); meaning and key facts/dates kept.
+# No flags, per the user.
+ALSO = [
+    (17, 'MALAYSIA', 'UNHCR stops sign-ups in Malaysia', 'people'),
+    (18, 'PACIFIC', 'Fiji declares drought disaster', 'sun'),
+    (19, 'CHINA', 'Trump raised ex-Nvidia boss with Xi', 'mic'),
+    (20, 'INDIA', "Pew: India's faith map is shifting", 'book'),
+    (21, 'WORLD', 'Islam set to be top faith by 2035', 'globe'),
+    (22, 'INDIA', 'William, Kate meet Modi in Mumbai', 'people'),
+    (23, 'MIDDLE EAST', 'Israel troops pass Gaza Yellow Line', 'people'),
+    (24, 'AUSTRALIA', 'Australia jobless hits 5-year high', 'chart'),
+    (25, 'UNITED STATES', "Musk calls midterm spree 'foolish'", 'mic'),
+    (26, 'UNITED STATES', 'Florida pastor guilty in Haiti case', 'gavel'),
+    (27, 'UNITED STATES', 'Fed split on bigger rate hike', 'chart'),
+    (28, 'EUROPE', 'Moldova teens try democracy app', 'book'),
+    (29, 'EUROPE', 'Spain strikes over housing crisis', 'house'),
+    (30, 'PAKISTAN', 'Pakistan 325, Sri Lanka toil in Test', 'tennis'),
+    (31, 'NEW ZEALAND', 'India-NZ Tests begin in Wellington', 'tennis'),
+    (32, 'SOUTH AFRICA', 'Rickelton ton tightens SA grip', 'tennis'),
+    (33, 'ASIA', 'HCMC Police stun Buriram 1-0', 'people'),
+    (34, 'SPACE', 'NASA: Swift fell over Indonesia', 'rocket'),
+    (35, 'AFRICA', 'Eagles hunted 57lb baboons in Chad', 'atom'),
+    (36, 'SCIENCE', 'Dental floss tests blood sugar', 'hospital'),
+    (37, 'TECHNOLOGY', 'AI teaches tractor to balance', 'car'),
+    (38, 'MARKETS', 'Dollar hits 19-month high, euro slips', 'coin'),
+    (39, 'SOUTH AFRICA', 'Mofokeng brace rescues Bafana', 'people'),
+    (40, 'INDIA', 'Reliance eyes satellites vs Starlink', 'rocket'),
+]
+
+ARTS = {'summit': art_summit, 'bridge': art_bridge, 'ipo': art_ipo,
+        'court': art_court}
 
 
-# ---------------------------------------------------------------- PNG decode
-def _paeth(a, b, c):
-    p = a + b - c
-    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
-    if pa <= pb and pa <= pc:
-        return a
-    if pb <= pc:
-        return b
-    return c
+# ---------------------------------------------------------------- layout ---
+def badge(cv, cx, cy, num, r=9):
+    cv.circle(cx, cy, r, RED)
+    s = str(num)
+    cv.text(cx - text_width(s, 1, bold=True) // 2, cy - 3, s, PAPER, 1,
+            bold=True)
 
 
-def read_png(path):
-    """Decode an 8-bit non-interlaced PNG (colour types 2 and 6) to RGBA bytes."""
-    with open(path, "rb") as f:
-        data = f.read()
-    if data[:8] != b"\x89PNG\r\n\x1a\n":
-        raise ValueError("not a PNG: %s" % path)
-    pos = 8
-    width = height = bitdepth = ctype = None
-    idat = bytearray()
-    while pos < len(data):
-        (length,) = struct.unpack(">I", data[pos:pos + 4])
-        ctype4 = data[pos + 4:pos + 8]
-        chunk = data[pos + 8:pos + 8 + length]
-        if ctype4 == b"IHDR":
-            width, height, bitdepth, ctype = struct.unpack(">IIBB", chunk[:10])
-            if bitdepth != 8 or ctype not in (2, 6):
-                raise ValueError("unsupported PNG %s: depth %d type %d" % (path, bitdepth, ctype))
-        elif ctype4 == b"IDAT":
-            idat += chunk
-        elif ctype4 == b"IEND":
-            break
-        pos += 12 + length
-    channels = 4 if ctype == 6 else 3
-    raw = zlib.decompress(bytes(idat))
-    stride = width * channels
-    out = bytearray(width * height * 4)
-    prev = bytearray(stride)
-    p = 0
-    for y in range(height):
-        ftype = raw[p]
-        p += 1
-        line = bytearray(raw[p:p + stride])
-        p += stride
-        if ftype == 1:
-            for i in range(channels, stride):
-                line[i] = (line[i] + line[i - channels]) & 255
-        elif ftype == 2:
-            for i in range(stride):
-                line[i] = (line[i] + prev[i]) & 255
-        elif ftype == 3:
-            for i in range(stride):
-                left = line[i - channels] if i >= channels else 0
-                line[i] = (line[i] + ((left + prev[i]) >> 1)) & 255
-        elif ftype == 4:
-            for i in range(stride):
-                a = line[i - channels] if i >= channels else 0
-                b = prev[i]
-                c = prev[i - channels] if i >= channels else 0
-                line[i] = (line[i] + _paeth(a, b, c)) & 255
-        elif ftype != 0:
-            raise ValueError("bad filter %d in %s" % (ftype, path))
-        for x in range(width):
-            o = (y * width + x) * 4
-            s = x * channels
-            out[o] = line[s]
-            out[o + 1] = line[s + 1]
-            out[o + 2] = line[s + 2]
-            out[o + 3] = line[s + 3] if channels == 4 else 255
-        prev = line
-    return width, height, bytes(out)
+def tag_text(cv, x, y, s):
+    cv.text(x, y, s, RED, 1, bold=True)
 
 
-# ---------------------------------------------------------------- PNG encode
-def write_png(path, width, height, rgb):
-    def chunk(tag, payload):
-        c = struct.pack(">I", len(payload)) + tag + payload
-        return c + struct.pack(">I", binascii.crc32(tag + payload) & 0xFFFFFFFF)
+def render():
+    cv = Canvas(W, H, CREAM)
+    cv.rect(6, 6, W - 12, H - 12, BORDER, 2)
 
-    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    raw = bytearray()
-    stride = width * 3
-    for y in range(height):
-        raw.append(0)
-        raw += rgb[y * stride:(y + 1) * stride]
-    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
-           + chunk(b"IDAT", zlib.compress(bytes(raw), 6)) + chunk(b"IEND", b""))
-    with open(path, "wb") as f:
-        f.write(png)
-    return len(png)
+    # ---- masthead ----
+    cv.text(14, 16, "THE WORLD'S NEWS IN ONE PICTURE", RED, 1.5, bold=True)
+    right = "40 STORIES - FIVE CONTINENTS"
+    cv.text(W - 14 - text_width(right, 1.5), 16, right, GREY, 1.5)
+    cv.text(14, 52, 'THURSDAY 19 NOVEMBER 2026', NAVY, 4, bold=True)
+    cv.fill_rect(14, 88, W - 28, 4, RED)
 
+    # ---- lead story #1 + map ----
+    num, region, head, summ, icon, art = LEAD
+    ax, ay, aw, ah = 14, 96, 634, 104
+    ARTS[art](cv, ax, ay, aw, ah)
+    cv.rect(ax, ay, aw, ah, BORDER, 1)
+    badge(cv, ax + 14, 214, num)
+    tag_text(cv, ax + 30, 211, region)
+    y = cv.text_block(ax, 228, head, NAVY, 3, aw, leading=23, bold=True)
+    cv.text_block(ax, y + 6, summ, INK, 1, aw, leading=9)
 
-# ---------------------------------------------------------------- canvas
-def new_canvas():
-    buf = bytearray(W * H * 3)
-    r, g, b = CREAM
-    for i in range(0, len(buf), 3):
-        buf[i] = r
-        buf[i + 1] = g
-        buf[i + 2] = b
-    return buf
+    mx, my, mw, mh = 664, 96, 346, 140
+    cv.fill_rect(mx, my, mw, mh, PAPER)
+    cv.rect(mx, my, mw, mh, BORDER, 1)
+    draw_map(cv, mx + 4, my + 4, mw - 8, mh - 8)
+    cap = 'WHERE IT HAPPENED'
+    cv.text(mx + (mw - text_width(cap, 1, bold=True)) // 2, my + mh + 8,
+            cap, NAVY, 1, bold=True)
+    sub = 'RED DOTS MARK THE BIG STORIES'
+    cv.text(mx + (mw - text_width(sub, 1)) // 2, my + mh + 20, sub, GREY, 1)
 
+    # ---- featured stories #2-#4, big themed art ----
+    fx0, fy, fw = 14, 296, 322
+    for i, (num, region, head, summ, icon, art) in enumerate(FEATURED):
+        x = fx0 + i * (fw + 15)
+        ARTS[art](cv, x, fy, fw, 86)
+        cv.rect(x, fy, fw, 86, BORDER, 1)
+        badge(cv, x + 14, fy + 100, num)
+        tag_text(cv, x + 30, fy + 97, region)
+        y = cv.text_block(x, fy + 112, head, NAVY, 2, fw, leading=17,
+                          bold=True)
+        cv.text_block(x, y + 3, summ, INK, 1, fw, leading=9)
 
-def fill_rect(buf, x0, y0, x1, y1, color):
-    x0 = max(0, x0)
-    y0 = max(0, y0)
-    x1 = min(W, x1)
-    y1 = min(H, y1)
-    r, g, b = color
-    row = bytes((r, g, b)) * (x1 - x0)
-    for y in range(y0, y1):
-        o = (y * W + x0) * 3
-        buf[o:o + len(row)] = row
+    # ---- grid stories #5-#16 ----
+    gx0, gy, gw, gh = 14, 476, 322, 72
+    for i, (num, region, head, summ, icon) in enumerate(GRID):
+        x = gx0 + (i % 3) * (gw + 15)
+        y = gy + (i // 3) * (gh + 4)
+        cv.fill_rect(x, y, gw, gh, PAPER)
+        cv.rect(x, y, gw, gh, BORDER, 1)
+        badge(cv, x + 14, y + 13, num)
+        tag_text(cv, x + 30, y + 10, region)
+        draw_icon(cv, icon, x + gw - 34, y + 6, 26, NAVY2)
+        # Headline first line wraps at 268 so it can never reach the
+        # top-right icon (icon starts at x+gw-34 = x+288); later lines
+        # use the full width, the icon band is above them.
+        yy = cv.text_block(x + 10, y + 26, head, NAVY, 2, gw - 20,
+                           leading=17, bold=True, first_w=268)
+        cv.text(x + 10, yy + 2, summ, GREY, 1)
 
+    # ---- ALSO section #17-#40: 3 cols x 8 rows, one-line bold
+    # headlines (round 5). Same 322px column rhythm as the grid, so
+    # the block reads as airy cards like the example — not a dense
+    # 4-col blur. Row = red number + small icon + one bold line.
+    ay0 = 778
+    cv.text(14, ay0, 'ALSO ON 19 NOVEMBER', NAVY, 2, bold=True)
+    cv.fill_rect(14, ay0 + 18, W - 28, 2, RED)
+    ax0, ayy, aw2, ah2 = 14, 800, 322, 20
+    for i, (num, region, head, icon) in enumerate(ALSO):
+        x = ax0 + (i % 3) * (aw2 + 15)
+        y = ayy + (i // 3) * (ah2 + 2)
+        cv.fill_rect(x, y, aw2, ah2, PAPER)
+        cv.rect(x, y, aw2, ah2, BORDER, 1)
+        cv.text(x + 4, y + 6, str(num), RED, 1, bold=True)
+        draw_icon(cv, icon, x + 22, y + 1, 18, NAVY2)
+        # Single line, bold scale 1.5: every headline is verified to
+        # fit the 272px text width (see /tmp/check_also.py).
+        cv.text(x + 44, y + 4, head, INK, 1.5, bold=True)
 
-def rounded_rect(buf, x0, y0, x1, y1, radius, color):
-    import math
-    r = radius
-    for y in range(y0, y1):
-        if y < y0 + r:
-            dy = (y0 + r) - y - 0.5
-            dx = math.sqrt(max(0.0, r * r - dy * dy))
-            xa = int((x0 + r) - dx)
-            xb = int((x1 - r) + dx)
-        elif y >= y1 - r:
-            dy = y - (y1 - r) + 0.5
-            dx = math.sqrt(max(0.0, r * r - dy * dy))
-            xa = int((x0 + r) - dx)
-            xb = int((x1 - r) + dx)
-        else:
-            xa, xb = x0, x1
-        fill_rect(buf, xa, y, xb, y + 1, color)
-
-
-def card(buf, x0, y0, x1, y1, radius=10):
-    rounded_rect(buf, x0, y0, x1, y1, radius, CARD_BORDER)
-    rounded_rect(buf, x0 + 1, y0 + 1, x1 - 1, y1 - 1, radius - 1, WHITE)
-
-
-# Decoded assets are reused across paste calls (paste_right used to decode
-# the same file twice); the cache keeps the run fast and deterministic.
-_ASSET_CACHE = {}
-
-
-def load_asset(path):
-    if path not in _ASSET_CACHE:
-        _ASSET_CACHE[path] = read_png(os.path.join(ASSETS, path))
-    return _ASSET_CACHE[path]
-
-
-def paste(buf, path, x0, y0):
-    w, h, px = load_asset(path)
-    for y in range(h):
-        dy = y0 + y
-        if dy < 0 or dy >= H:
-            continue
-        for x in range(w):
-            dx = x0 + x
-            if dx < 0 or dx >= W:
-                continue
-            o = (y * w + x) * 4
-            a = px[o + 3]
-            if a == 0:
-                continue
-            bo = (dy * W + dx) * 3
-            if a == 255:
-                buf[bo] = px[o]
-                buf[bo + 1] = px[o + 1]
-                buf[bo + 2] = px[o + 2]
-            else:
-                buf[bo] = (px[o] * a + buf[bo] * (255 - a)) // 255
-                buf[bo + 1] = (px[o + 1] * a + buf[bo + 1] * (255 - a)) // 255
-                buf[bo + 2] = (px[o + 2] * a + buf[bo + 2] * (255 - a)) // 255
-
-
-def paste_right(buf, path, right_x, y0):
-    w, _h, _px = load_asset(path)
-    paste(buf, path, right_x - w, y0)
+    # ---- footer ----
+    cv.text(14, 984, 'AND FINALLY: BABOON-HUNTING EAGLES AND A '
+                     'BALANCING TRACTOR', NAVY, 2, bold=True)
+    cv.text(14, 1004, 'Every story reported on Thursday 19 November 2026 - '
+                      'Sources: Reuters, BBC, NYT, AP, The Guardian, NDTV, '
+                      'AFP, AAP, Global Voices', GREY, 1)
+    return cv
 
 
 def main():
-    buf = new_canvas()
-    # page frame
-    rounded_rect(buf, 10, 10, 1014, 1014, 16, PAGE_BORDER)
-    rounded_rect(buf, 12, 12, 1012, 1012, 15, CREAM)
-
-    # masthead
-    paste(buf, "txt_kicker.png", 24, 30)
-    paste_right(buf, "txt_kicker_right.png", 1000, 32)
-    paste(buf, "txt_title.png", 24, 52)
-    fill_rect(buf, 24, 124, 1000, 126, NAVY)
-
-    # lead story + map
-    card(buf, 24, 140, 548, 360)
-    paste(buf, "lead_art.png", 34, 150)
-    paste(buf, "lead_text.png", 228, 150)
-    card(buf, 560, 140, 1000, 360)
-    paste(buf, "txt_map_head.png", 574, 150)
-    paste_right(buf, "txt_map_date.png", 986, 152)
-    paste(buf, "map_base.png", 568, 174)
-
-    # three featured stories
-    for i, n in enumerate((2, 3, 4)):
-        x = 24 + i * 332
-        card(buf, x, 372, x + 312, 584)
-        paste(buf, "feat%d_banner.png" % n, x + 6, 378)
-        paste(buf, "feat%d_text.png" % n, x + 12, 468)
-
-    # also on 19 november: 12 compact stories
-    card(buf, 24, 596, 1000, 984)
-    paste(buf, "txt_also.png", 36, 608)
-    for idx, n in enumerate(range(5, 17)):
-        col, row = idx % 3, idx // 3
-        cx = 24 + col * 325
-        ry = 632 + row * 88
-        paste(buf, "icon_%d.png" % n, cx + 12, ry + 12)
-        paste(buf, "also_text_%d.png" % n, cx + 82, ry + 12)
-
-    # footer
-    paste(buf, "txt_footer.png", 94, 994)
-
-    outdir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
+    outdir = os.environ.get('MAKEFUN_OUTPUT_DIR') or '/output'
+    if not os.path.isdir(outdir):
+        outdir = os.path.dirname(os.path.abspath(__file__))
     os.makedirs(outdir, exist_ok=True)
-    outpath = os.path.join(outdir, "entry.png")
-    nbytes = write_png(outpath, W, H, bytes(buf))
-    try:
-        write_png(os.path.join(HERE, "entry.png"), W, H, bytes(buf))
-    except OSError:
-        pass
-    print("wrote %s (%d bytes)" % (outpath, nbytes))
-    return 0
+    cv = render()
+    path = os.path.join(outdir, 'entry.png')
+    n = cv.save_png(path)
+    print('wrote %s (%d bytes, %dx%d)' % (path, n, W, H))
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__ == '__main__':
+    main()

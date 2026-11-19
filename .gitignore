@@ -1,2 +1,5 @@
 entry.png
 __pycache__/
+*.pyc
+out/
+fonts-src/
